@@ -35,7 +35,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/workqueue"
-	clock "k8s.io/utils/clock/testing"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -74,7 +73,6 @@ func BenchmarkNotification100(b *testing.B) {
 //nolint:gocyclo
 func benchmarkNotificationController(b *testing.B, messageCount int) {
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("message-count", messageCount))
-	fakeClock = &clock.FakeClock{}
 	ctx = coreoptions.ToContext(ctx, coretest.Options())
 	ctx = options.ToContext(ctx, test.Options(test.OptionsFields{
 		ClusterName:       lo.ToPtr("karpenter-notification-benchmarking"),
@@ -110,7 +108,7 @@ func benchmarkNotificationController(b *testing.B, messageCount int) {
 	unavailableOfferingsCache = awscache.NewUnavailableOfferings()
 
 	// Set-up the controllers
-	interruptionController := interruption.NewController(env.Client, fakeClock, nil, recorder, providers.sqsProvider, nil, unavailableOfferingsCache, nil)
+	interruptionController := interruption.NewController(env.Client, recorder, providers.sqsProvider, nil, unavailableOfferingsCache, nil)
 
 	messages, nodes := makeDiverseMessagesAndNodes(messageCount)
 	log.FromContext(ctx).Info("provisioning nodes")

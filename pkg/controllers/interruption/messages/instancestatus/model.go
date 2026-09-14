@@ -20,22 +20,19 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages"
 )
 
-// Message represents a single category from an EC2 DescribeInstanceStatus response.
-// The Kind maps directly to the EC2 status category (instance_status, system_status, event_status).
+// Message represents a scheduled event from an EC2 DescribeInstanceStatus response.
 type Message struct {
 	instanceID string
-	kind       messages.Kind
 	startTime  time.Time
 }
 
-func New(instanceID string, kind messages.Kind, startTime time.Time) Message {
+func New(instanceID string, startTime time.Time) Message {
 	return Message{
 		instanceID: instanceID,
-		kind:       kind,
 		startTime:  startTime,
 	}
 }
 
 func (m Message) EC2InstanceIDs() []string { return []string{m.instanceID} }
-func (m Message) Kind() messages.Kind      { return m.kind }
+func (m Message) Kind() messages.Kind      { return messages.EventStatusKind }
 func (m Message) StartTime() time.Time     { return m.startTime }

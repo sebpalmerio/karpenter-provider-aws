@@ -50,6 +50,7 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/providers/amifamily"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instance"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancetype"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/placementgroup"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/securitygroup"
@@ -304,6 +305,13 @@ func (c *CloudProvider) GetSupportedNodeClasses() []status.Object {
 
 func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 	return []cloudprovider.RepairPolicy{
+		// The dependent Karpenter core repair-policy work must extend this entry with the
+		// reason fallback, replacement action, and five-minute drain bound.
+		{
+			ConditionType:      instancestatus.ConditionTypeEC2StatusImpaired,
+			ConditionStatus:    corev1.ConditionTrue,
+			TolerationDuration: 2 * time.Minute,
+		},
 		// Supported Kubelet Node Conditions
 		{
 			ConditionType:      corev1.NodeReady,

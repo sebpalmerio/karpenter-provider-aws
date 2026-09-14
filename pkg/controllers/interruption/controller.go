@@ -26,12 +26,10 @@ import (
 	"github.com/awslabs/operatorpkg/singleton"
 	"go.uber.org/multierr"
 	"k8s.io/client-go/util/workqueue"
-	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 	"sigs.k8s.io/karpenter/pkg/utils/pretty"
@@ -55,8 +53,6 @@ type Controller struct {
 
 func NewController(
 	kubeClient client.Client,
-	clk clock.Clock,
-	cloudProvider cloudprovider.CloudProvider,
 	recorder events.Recorder,
 	sqsProvider sqs.Provider,
 	sqsAPI *sqsapi.Client,
@@ -66,8 +62,6 @@ func NewController(
 	return &Controller{
 		InterruptionHandler: InterruptionHandler{
 			kubeClient:                  kubeClient,
-			clk:                         clk,
-			cloudProvider:               cloudProvider,
 			recorder:                    recorder,
 			unavailableOfferingsCache:   unavailableOfferingsCache,
 			capacityReservationProvider: capacityReservationProvider,

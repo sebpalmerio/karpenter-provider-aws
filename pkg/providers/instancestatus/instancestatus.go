@@ -23,6 +23,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/samber/lo"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/utils/clock"
 
 	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
@@ -41,29 +42,28 @@ const (
 	EBSStatus = Category("EBSStatus")
 )
 
-var (
-	UnhealthyThreshold = 120 * time.Second
+const (
+	ConditionTypeEC2StatusImpaired corev1.NodeConditionType = "EC2StatusImpaired"
+	ReasonReachabilityFailed       string                   = "ReachabilityFailed"
+	ReasonNoImpairmentReported     string                   = "NoImpairmentReported"
+)
 
-	// instanceStatusFilters are the server-side filters used to scope DescribeInstanceStatus calls.
-	// We use separate filter sets because DescribeInstanceStatus ANDs filters across different
-	// filter names, and we need to OR across instance status failures, system status failures,
-	// and scheduled maintenance events.
-	// EBS status check failures are ignored for now.
-	instanceStatusFilters = [][]ec2types.Filter{
-		{{Name: lo.ToPtr("instance-status.status"), Values: []string{string(ec2types.SummaryStatusImpaired)}}},
-		{{Name: lo.ToPtr("system-status.status"), Values: []string{string(ec2types.SummaryStatusImpaired)}}},
-		{{Name: lo.ToPtr("event.code"), Values: []string{
+var instanceStatusFilters = map[Category][]ec2types.Filter{
+	InstanceStatus: {{Name: lo.ToPtr("instance-status.status"), Values: []string{string(ec2types.SummaryStatusImpaired)}}},
+	SystemStatus:   {{Name: lo.ToPtr("system-status.status"), Values: []string{string(ec2types.SummaryStatusImpaired)}}},
+	EventStatus: {
+		{Name: lo.ToPtr("event.code"), Values: []string{
 			string(ec2types.EventCodeInstanceReboot),
 			string(ec2types.EventCodeSystemReboot),
 			string(ec2types.EventCodeSystemMaintenance),
 			string(ec2types.EventCodeInstanceRetirement),
 			string(ec2types.EventCodeInstanceStop),
-		}}},
-	}
-)
+		}},
+	},
+}
 
 type Provider interface {
-	List(context.Context) ([]HealthStatus, error)
+	List(context.Context, Category) ([]HealthStatus, error)
 }
 
 type DefaultProvider struct {
@@ -92,44 +92,29 @@ func NewDefaultProvider(ec2API sdk.EC2API, clk clock.Clock) *DefaultProvider {
 	}
 }
 
-func (p DefaultProvider) List(ctx context.Context) ([]HealthStatus, error) {
-	seen := map[string]struct{}{}
+func (p DefaultProvider) List(ctx context.Context, category Category) ([]HealthStatus, error) {
+	filters, ok := instanceStatusFilters[category]
+	if !ok {
+		return nil, fmt.Errorf("unsupported EC2 instance status category %q", category)
+	}
 	var statuses []ec2types.InstanceStatus
-	for _, filters := range instanceStatusFilters {
-		pager := ec2.NewDescribeInstanceStatusPaginator(p.ec2api, &ec2.DescribeInstanceStatusInput{
-			Filters: filters,
-		})
-		for pager.HasMorePages() {
-			out, err := pager.NextPage(ctx)
-			if err != nil {
-				return nil, fmt.Errorf("failed describing ec2 instance status checks, %w", err)
-			}
-			for _, s := range out.InstanceStatuses {
-				if _, ok := seen[*s.InstanceId]; !ok {
-					seen[*s.InstanceId] = struct{}{}
-					statuses = append(statuses, s)
-				}
-			}
+	pager := ec2.NewDescribeInstanceStatusPaginator(p.ec2api, &ec2.DescribeInstanceStatusInput{
+		Filters: filters,
+	})
+	for pager.HasMorePages() {
+		out, err := pager.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("describing EC2 %s checks, %w", category, err)
 		}
+		statuses = append(statuses, out.InstanceStatuses...)
 	}
 
 	var healthStatuses []HealthStatus
 	for _, statusChecks := range statuses {
-		healthStatus := p.newHealthStatus(statusChecks)
-		// Filter out statuses that we do not consider unhealthy or do not want to handle right now
+		healthStatus := p.newHealthStatus(statusChecks, category)
 		healthStatus.Details = lo.Filter(healthStatus.Details, func(details Details, _ int) bool {
-			if details.Status != ec2types.StatusTypeFailed {
-				return false
-			}
-			// Do not evaluate against the unhealthy threshold when its a scheduled maintenance event.
-			// Scheduled maintenance events often have a future scheduled time which makes a threshold
-			// difficult to utilize. We take the stance that if there is a scheduled maintenance event,
-			// then there is something wrong with the underlying host that warrants vacating immediately.
-			// This matches how we process scheduled maintenance events from EventBridge.
-			if details.Category == EventStatus {
-				return true
-			}
-			return p.clk.Since(details.ImpairedSince) >= UnhealthyThreshold
+			return details.Status == ec2types.StatusTypeFailed &&
+				(details.Category == EventStatus || details.Name == string(ec2types.StatusNameReachability))
 		})
 		if len(healthStatus.Details) == 0 {
 			continue
@@ -143,55 +128,44 @@ func (p DefaultProvider) List(ctx context.Context) ([]HealthStatus, error) {
 }
 
 // newHealthStatus constructs a more consumable version of Health Status Details from the different status checks
-func (p DefaultProvider) newHealthStatus(statusChecks ec2types.InstanceStatus) HealthStatus {
+func (p DefaultProvider) newHealthStatus(statusChecks ec2types.InstanceStatus, category Category) HealthStatus {
 	healthStatus := HealthStatus{
 		InstanceID: *statusChecks.InstanceId,
 		Overall:    ec2types.SummaryStatusImpaired,
 	}
-	if statusChecks.InstanceStatus != nil {
+	if category == InstanceStatus && statusChecks.InstanceStatus != nil {
 		healthStatus.Details = append(healthStatus.Details, lo.Map(statusChecks.InstanceStatus.Details, func(details ec2types.InstanceStatusDetails, _ int) Details {
-			return p.newDetails(details, InstanceStatus)
+			return newStatusDetails(details, InstanceStatus)
 		})...)
 	}
-	if statusChecks.SystemStatus != nil {
+	if category == SystemStatus && statusChecks.SystemStatus != nil {
 		healthStatus.Details = append(healthStatus.Details, lo.Map(statusChecks.SystemStatus.Details, func(details ec2types.InstanceStatusDetails, _ int) Details {
-			return p.newDetails(details, SystemStatus)
+			return newStatusDetails(details, SystemStatus)
 		})...)
 	}
-	if statusChecks.AttachedEbsStatus != nil {
-		healthStatus.Details = append(healthStatus.Details, lo.Map(statusChecks.AttachedEbsStatus.Details, func(details ec2types.EbsStatusDetails, _ int) Details {
-			return p.newDetails(details, EBSStatus)
+	if category == EventStatus {
+		healthStatus.Details = append(healthStatus.Details, lo.Map(statusChecks.Events, func(details ec2types.InstanceStatusEvent, _ int) Details {
+			return p.newEventDetails(details)
 		})...)
 	}
-	healthStatus.Details = append(healthStatus.Details, lo.Map(statusChecks.Events, func(details ec2types.InstanceStatusEvent, _ int) Details {
-		return p.newDetails(details, EventStatus)
-	})...)
 	return healthStatus
 }
 
-func (p DefaultProvider) newDetails(details any, category Category) Details {
-	if ec2Details, ok := details.(ec2types.InstanceStatusDetails); ok {
-		return Details{
-			Category:      category,
-			Name:          string(ec2Details.Name),
-			Status:        ec2Details.Status,
-			ImpairedSince: lo.FromPtr(ec2Details.ImpairedSince),
-		}
-	}
-	if ec2Events, ok := details.(ec2types.InstanceStatusEvent); ok {
-		return Details{
-			Category: category,
-			Name:     string(ec2Events.Code),
-			// treat all scheduled maintenance events as failures
-			Status:        ec2types.StatusTypeFailed,
-			ImpairedSince: p.clk.Now(),
-		}
-	}
-	ebsDetails := details.(ec2types.EbsStatusDetails)
+func newStatusDetails(details ec2types.InstanceStatusDetails, category Category) Details {
 	return Details{
 		Category:      category,
-		Name:          string(ebsDetails.Name),
-		Status:        ebsDetails.Status,
-		ImpairedSince: lo.FromPtr(ebsDetails.ImpairedSince),
+		Name:          string(details.Name),
+		Status:        details.Status,
+		ImpairedSince: lo.FromPtr(details.ImpairedSince),
+	}
+}
+
+func (p DefaultProvider) newEventDetails(event ec2types.InstanceStatusEvent) Details {
+	return Details{
+		Category: EventStatus,
+		Name:     string(event.Code),
+		// All scheduled maintenance events remain actionable interruption signals.
+		Status:        ec2types.StatusTypeFailed,
+		ImpairedSince: p.clk.Now(),
 	}
 }

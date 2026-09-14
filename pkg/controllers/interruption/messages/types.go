@@ -41,11 +41,8 @@ const (
 	InstanceStoppedKind                 Kind = "instance_stopped"
 	InstanceTerminatedKind              Kind = "instance_terminated"
 	CapacityReservationInterruptionKind Kind = "capacity_reservation_interrupted"
-	// Kinds from EC2 DescribeInstanceStatus categories
-	InstanceStatusKind Kind = "instance_status"
-	SystemStatusKind   Kind = "system_status"
-	EventStatusKind    Kind = "event_status"
-	NoOpKind           Kind = "no_op"
+	EventStatusKind                     Kind = "event_status"
+	NoOpKind                            Kind = "no_op"
 )
 
 type Metadata struct {

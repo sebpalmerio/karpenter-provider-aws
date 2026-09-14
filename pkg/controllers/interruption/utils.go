@@ -17,18 +17,14 @@ package interruption
 import (
 	"context"
 	"fmt"
-	"time"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
-	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
-	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -43,17 +39,14 @@ import (
 type Action string
 
 const (
-	CordonAndDrain      Action = "CordonAndDrain"
-	ForcefulTermination Action = "ForcefulTermination"
-	NoAction            Action = "NoAction"
+	CordonAndDrain Action = "CordonAndDrain"
+	NoAction       Action = "NoAction"
 )
 
 // InterruptionHandler contains shared logic for handling interruption messages
 // from both the SQS queue and the DescribeInstanceStatus API.
 type InterruptionHandler struct {
 	kubeClient                  client.Client
-	clk                         clock.Clock
-	cloudProvider               cloudprovider.CloudProvider
 	recorder                    events.Recorder
 	unavailableOfferingsCache   *cache.UnavailableOfferings
 	capacityReservationProvider capacityreservation.Provider
@@ -115,14 +108,6 @@ func (h *InterruptionHandler) handleNodeClaim(ctx context.Context, msg messages.
 	h.markUnavailableOfferings(ctx, msg, nodeClaim)
 
 	switch action {
-	case ForcefulTermination:
-		// TODO(Node Repair): Once Node Repair (kubernetes-sigs/karpenter#2398) graduates to GA,
-		// this should be migrated to use repair policies instead of directly annotating the
-		// termination timestamp.
-		if err := h.annotateTerminationTimestamp(ctx, nodeClaim); err != nil {
-			return err
-		}
-		return h.deleteNodeClaim(ctx, msg, nodeClaim, node)
 	case CordonAndDrain:
 		return h.deleteNodeClaim(ctx, msg, nodeClaim, node)
 	default:
@@ -172,30 +157,12 @@ func (h *InterruptionHandler) deleteNodeClaim(ctx context.Context, msg messages.
 	return nil
 }
 
-// annotateTerminationTimestamp sets the NodeClaimTerminationTimestampAnnotationKey annotation
-// to the current time, causing the termination controller to bypass graceful drain (PDB-respecting
-// eviction) and volume detachment waits. This is used for instance health failures where the
-// instance is already broken and graceful drain may not be possible.
-func (h *InterruptionHandler) annotateTerminationTimestamp(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
-	if _, exists := nodeClaim.Annotations[karpv1.NodeClaimTerminationTimestampAnnotationKey]; exists {
-		return nil
-	}
-	stored := nodeClaim.DeepCopy()
-	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
-		karpv1.NodeClaimTerminationTimestampAnnotationKey: h.clk.Now().Format(time.RFC3339),
-	})
-	if err := h.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	return nil
-}
-
 // notifyForMessage publishes the relevant alert based on the message kind
 func (h *InterruptionHandler) notifyForMessage(msg messages.Message, nodeClaim *karpv1.NodeClaim, n *corev1.Node) {
 	switch msg.Kind() {
 	case messages.RebalanceRecommendationKind:
 		h.recorder.Publish(interruptionevents.RebalanceRecommendation(n, nodeClaim)...)
-	case messages.ScheduledChangeKind, messages.EventStatusKind, messages.InstanceStatusKind, messages.SystemStatusKind:
+	case messages.ScheduledChangeKind, messages.EventStatusKind:
 		h.recorder.Publish(interruptionevents.Unhealthy(n, nodeClaim)...)
 	case messages.SpotInterruptionKind:
 		h.recorder.Publish(interruptionevents.SpotInterrupted(n, nodeClaim)...)
@@ -211,8 +178,6 @@ func (h *InterruptionHandler) notifyForMessage(msg messages.Message, nodeClaim *
 
 func actionForMessage(msg messages.Message) Action {
 	switch msg.Kind() {
-	case messages.InstanceStatusKind, messages.SystemStatusKind:
-		return ForcefulTermination
 	case messages.ScheduledChangeKind, messages.EventStatusKind, messages.SpotInterruptionKind, messages.InstanceStoppedKind, messages.InstanceTerminatedKind, messages.CapacityReservationInterruptionKind:
 		return CordonAndDrain
 	default:
