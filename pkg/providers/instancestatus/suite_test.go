@@ -16,6 +16,8 @@ package instancestatus_test
 
 import (
 	"context"
+	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/samber/lo"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
+	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
 	"github.com/aws/karpenter-provider-aws/pkg/operator/options"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/test"
@@ -37,6 +40,22 @@ import (
 var ctx context.Context
 var env *coretest.Environment
 var awsEnv *test.Environment
+
+type failSecondDescribeInstanceStatusEC2API struct {
+	sdk.EC2API
+	calls atomic.Int64
+}
+
+func (f *failSecondDescribeInstanceStatusEC2API) DescribeInstanceStatus(
+	ctx context.Context,
+	input *ec2.DescribeInstanceStatusInput,
+	optFns ...func(*ec2.Options),
+) (*ec2.DescribeInstanceStatusOutput, error) {
+	if f.calls.Add(1) == 2 {
+		return nil, errors.New("injected second-page failure")
+	}
+	return f.EC2API.DescribeInstanceStatus(ctx, input, optFns...)
+}
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -152,6 +171,33 @@ var _ = Describe("Instance Status Provider", func() {
 			Expect(statuses).To(HaveLen(1))
 			Expect(statuses[0].ImpairedSince).To(Equal(awsEnv.Clock.Now()))
 		})
+		It("should select the earliest reported non-zero impairment time", func() {
+			validOnset := awsEnv.Clock.Now().Add(-5 * time.Minute)
+			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
+				InstanceStatuses: []ec2types.InstanceStatus{{
+					InstanceId: lo.ToPtr("i-0123456789"),
+					InstanceStatus: &ec2types.InstanceStatusSummary{
+						Status: ec2types.SummaryStatusImpaired,
+						Details: []ec2types.InstanceStatusDetails{
+							{
+								Name:   ec2types.StatusNameReachability,
+								Status: ec2types.StatusTypeFailed,
+							},
+							{
+								Name:          ec2types.StatusNameReachability,
+								Status:        ec2types.StatusTypeFailed,
+								ImpairedSince: lo.ToPtr(validOnset),
+							},
+						},
+					},
+				}},
+			})
+
+			statuses, err := awsEnv.InstanceStatusProvider.List(ctx, instancestatus.InstanceStatus)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(statuses).To(HaveLen(1))
+			Expect(statuses[0].ImpairedSince).To(Equal(validOnset))
+		})
 		It("should not return healthy statuses", func() {
 			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
 				InstanceStatuses: []ec2types.InstanceStatus{
@@ -243,6 +289,30 @@ var _ = Describe("Instance Status Provider", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(statuses).To(HaveLen(2))
 			Expect(awsEnv.EC2API.DescribeInstanceStatusBehavior.SuccessfulCalls()).To(Equal(2))
+		})
+		It("should discard partial results when a later response page fails", func() {
+			awsEnv.EC2API.DescribeInstanceStatusOutput.Reset()
+			for _, instanceID := range []string{"i-1", "i-2"} {
+				awsEnv.EC2API.DescribeInstanceStatusBehavior.OutputPages.Add(&ec2.DescribeInstanceStatusOutput{
+					InstanceStatuses: []ec2types.InstanceStatus{{
+						InstanceId: lo.ToPtr(instanceID),
+						InstanceStatus: &ec2types.InstanceStatusSummary{
+							Details: []ec2types.InstanceStatusDetails{{
+								Name:          ec2types.StatusNameReachability,
+								Status:        ec2types.StatusTypeFailed,
+								ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
+							}},
+						},
+					}},
+				})
+			}
+			ec2API := &failSecondDescribeInstanceStatusEC2API{EC2API: awsEnv.EC2API}
+			provider := instancestatus.NewDefaultProvider(ec2API, awsEnv.Clock)
+
+			statuses, err := provider.List(ctx, instancestatus.InstanceStatus)
+			Expect(err).To(MatchError(ContainSubstring("injected second-page failure")))
+			Expect(statuses).To(BeNil())
+			Expect(ec2API.calls.Load()).To(Equal(int64(2)))
 		})
 		It("should reject assessment categories without a routing contract", func() {
 			_, err := awsEnv.InstanceStatusProvider.List(ctx, instancestatus.EBSStatus)

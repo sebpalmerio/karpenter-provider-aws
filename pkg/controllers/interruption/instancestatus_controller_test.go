@@ -22,10 +22,12 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/tools/record"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
+	"github.com/aws/karpenter-provider-aws/pkg/apis"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 
@@ -37,9 +39,24 @@ import (
 type instanceStatusProvider struct {
 	statuses map[instancestatus.Category][]instancestatus.HealthStatus
 	errors   map[instancestatus.Category]error
+	hooks    map[instancestatus.Category]func()
+}
+
+type nodeClaimDeleteErrorClient struct {
+	client.Client
+}
+
+func (c *nodeClaimDeleteErrorClient) Delete(ctx context.Context, object client.Object, opts ...client.DeleteOption) error {
+	if _, ok := object.(*karpv1.NodeClaim); ok {
+		return errors.New("injected NodeClaim delete failure")
+	}
+	return c.Client.Delete(ctx, object, opts...)
 }
 
 func (p *instanceStatusProvider) List(_ context.Context, category instancestatus.Category) ([]instancestatus.HealthStatus, error) {
+	if hook := p.hooks[category]; hook != nil {
+		hook()
+	}
 	if err := p.errors[category]; err != nil {
 		return nil, err
 	}
@@ -58,6 +75,7 @@ var _ = Describe("EC2 Status Conditions", func() {
 		provider = &instanceStatusProvider{
 			statuses: map[instancestatus.Category][]instancestatus.HealthStatus{},
 			errors:   map[instancestatus.Category]error{},
+			hooks:    map[instancestatus.Category]func(){},
 		}
 		statusController = interruption.NewInstanceStatusController(
 			env.Client,
@@ -66,6 +84,9 @@ var _ = Describe("EC2 Status Conditions", func() {
 			provider,
 		)
 		nodeClaim, node = coretest.NodeClaimAndNode(karpv1.NodeClaim{
+			Spec: karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{
+				Group: apis.Group, Kind: "EC2NodeClass", Name: "default",
+			}},
 			Status: karpv1.NodeClaimStatus{
 				ProviderID: "aws:///test-zone/i-0123456789",
 			},
@@ -140,6 +161,21 @@ var _ = Describe("EC2 Status Conditions", func() {
 		Expect(condition.LastTransitionTime.Time.Equal(fakeClock.Now())).To(BeTrue())
 	})
 
+	It("captures health observation time before independently polling scheduled events", func() {
+		observationTime := fakeClock.Now()
+		provider.hooks[instancestatus.EventStatus] = func() {
+			fakeClock.Step(10 * time.Minute)
+		}
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+
+		ExpectSingletonReconciled(ctx, statusController)
+
+		node = ExpectExists(ctx, env.Client, node)
+		condition := ExpectEC2StatusCondition(node, corev1.ConditionFalse, instancestatus.ReasonNoImpairmentReported)
+		Expect(condition.LastTransitionTime.Time.Equal(observationTime)).To(BeTrue())
+		Expect(fakeClock.Now()).To(Equal(observationTime.Add(10 * time.Minute)))
+	})
+
 	It("publishes false when the first complete assessment reports no impairment", func() {
 		ExpectApplied(ctx, env.Client, nodeClaim, node)
 
@@ -211,8 +247,22 @@ var _ = Describe("EC2 Status Conditions", func() {
 		ExpectSingletonReconciled(ctx, statusController)
 
 		node = ExpectExists(ctx, env.Client, node)
-		_, found := findEC2StatusCondition(node)
-		Expect(found).To(BeFalse())
+		Expect(hasEC2StatusCondition(node)).To(BeFalse())
+	})
+
+	It("does not publish for a NodeClaim managed by another provider", func() {
+		nodeClaim.Spec.NodeClassRef.Group = "example.com"
+		nodeClaim.Spec.NodeClassRef.Kind = "OtherNodeClass"
+		provider.statuses[instancestatus.InstanceStatus] = []instancestatus.HealthStatus{{
+			InstanceID:    instanceID,
+			ImpairedSince: fakeClock.Now(),
+		}}
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+
+		ExpectSingletonReconciled(ctx, statusController)
+
+		node = ExpectExists(ctx, env.Client, node)
+		Expect(hasEC2StatusCondition(node)).To(BeFalse())
 	})
 
 	It("publishes health independently of the NodeRepair feature gate", func() {
@@ -227,13 +277,33 @@ var _ = Describe("EC2 Status Conditions", func() {
 		node = ExpectExists(ctx, env.Client, node)
 		ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
 	})
+
+	It("records a detected scheduled event when handling the NodeClaim fails", func() {
+		provider.statuses[instancestatus.EventStatus] = []instancestatus.HealthStatus{{
+			InstanceID:    instanceID,
+			ImpairedSince: fakeClock.Now(),
+		}}
+		statusController = interruption.NewInstanceStatusController(
+			&nodeClaimDeleteErrorClient{Client: env.Client},
+			fakeClock,
+			events.NewRecorder(&record.FakeRecorder{}),
+			provider,
+		)
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+
+		_ = ExpectSingletonReconcileFailed(ctx, statusController)
+
+		ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+			"category": "EventStatus",
+		})
+	})
 })
 
-func findEC2StatusCondition(node *corev1.Node) (corev1.NodeCondition, bool) {
+func hasEC2StatusCondition(node *corev1.Node) bool {
 	for _, condition := range node.Status.Conditions {
 		if condition.Type == instancestatus.ConditionTypeEC2StatusImpaired {
-			return condition, true
+			return true
 		}
 	}
-	return corev1.NodeCondition{}, false
+	return false
 }

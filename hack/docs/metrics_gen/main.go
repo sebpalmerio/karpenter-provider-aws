@@ -171,7 +171,7 @@ type valueInfo struct {
 // Maps a metric to a []Value var this provider merges into its `reason` dimension,
 // for reasons a core Label can't enumerate (EC2 event kinds -> nodeclaims_disrupted_total).
 var reasonValueContributions = map[string]string{
-	"karpenter_nodeclaims_disrupted_total": "interruptionKindValues",
+	"karpenter_nodeclaims_disrupted_total": "interruptionDisruptionReasonValues",
 }
 
 // Docs for THIRD-PARTY metric dimensions (aws-sdk-go, controller-runtime, client-go)

@@ -17,7 +17,9 @@ package interruption_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -80,6 +82,18 @@ var unavailableOfferingsCache *awscache.UnavailableOfferings
 var fakeClock *clock.FakeClock
 var controller *interruption.Controller
 var instanceStatusController *interruption.InstanceStatusController
+
+type nodeClaimListFailureClient struct {
+	client.Client
+	failNext atomic.Bool
+}
+
+func (c *nodeClaimListFailureClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
+	if _, ok := list.(*karpv1.NodeClaimList); ok && c.failNext.CompareAndSwap(true, false) {
+		return errors.New("injected NodeClaim list failure")
+	}
+	return c.Client.List(ctx, list, opts...)
+}
 
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
@@ -573,12 +587,19 @@ var _ = Describe("InterruptionHandling", func() {
 			awsEnv.Clock.Step(time.Hour)
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 
-			// Reconcile multiple times with the same unhealthy instance
-			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectSingletonReconciled(ctx, instanceStatusController)
+			failingClient := &nodeClaimListFailureClient{Client: env.Client}
+			retryingController := interruption.NewInstanceStatusController(
+				failingClient,
+				fakeClock,
+				events.NewRecorder(&record.FakeRecorder{}),
+				awsEnv.InstanceStatusProvider,
+			)
 
-			// Metric should only have been incremented once despite three reconciles
+			ExpectSingletonReconciled(ctx, retryingController)
+			failingClient.failNext.Store(true)
+			_ = ExpectSingletonReconcileFailed(ctx, retryingController)
+			ExpectSingletonReconciled(ctx, retryingController)
+
 			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
 				"category": "InstanceStatus",
 			})
@@ -701,6 +722,43 @@ var _ = Describe("InterruptionHandling", func() {
 			ExpectSingletonReconciled(ctx, instanceStatusController)
 
 			// Metric should now be 2 (counted once for each occurrence)
+			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 2, map[string]string{
+				"category": "InstanceStatus",
+			})
+		})
+		It("should count a still-active occurrence again after the controller process restarts", func() {
+			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{InterruptionQueue: lo.ToPtr("")}))
+			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
+				InstanceStatuses: []ec2types.InstanceStatus{
+					{
+						InstanceId: lo.ToPtr(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))),
+						InstanceStatus: &ec2types.InstanceStatusSummary{
+							Status: ec2types.SummaryStatusImpaired,
+							Details: []ec2types.InstanceStatusDetails{
+								{
+									Status:        ec2types.StatusTypeFailed,
+									Name:          ec2types.StatusNameReachability,
+									ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
+								},
+							},
+						},
+					},
+				},
+			})
+			ExpectApplied(ctx, env.Client, nodeClaim, node)
+
+			ExpectSingletonReconciled(ctx, instanceStatusController)
+			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+				"category": "InstanceStatus",
+			})
+
+			restartedController := interruption.NewInstanceStatusController(
+				env.Client,
+				fakeClock,
+				events.NewRecorder(&record.FakeRecorder{}),
+				awsEnv.InstanceStatusProvider,
+			)
+			ExpectSingletonReconciled(ctx, restartedController)
 			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 2, map[string]string{
 				"category": "InstanceStatus",
 			})

@@ -156,7 +156,7 @@ The resulting provider policy is:
 
 | Condition type | Status | Reason regex | Toleration | Termination grace period | Action |
 | --- | --- | --- | --- | --- | --- |
-| `EC2StatusImpaired` | `True` | `.*` | `2m` | `5m` | `ReplaceNode` |
+| `EC2StatusImpaired` | `True` | empty fallback | `2m` | `5m` | `ReplaceNode` |
 
 Toleration is measured from `lastTransitionTime`. A newly published condition may therefore be immediately eligible when EC2 reports an onset more than two minutes old. In the example above, aggregate impairment becomes eligible at `10:02`.
 
@@ -167,6 +167,8 @@ The five-minute drain bound starts at repair commitment, as defined by candidate
 The Node condition exposes the last aggregate EC2 impairment state and when the uninterrupted aggregate state began. Its message identifies completed assessments currently observed failing and any assessment scan that did not complete.
 
 After matching, repair decision logs and shared budget and veto signals explain the selected action or why it did not proceed. Existing [AWS SDK metrics](https://karpenter.sh/docs/reference/metrics/#aws-sdk-go-metrics) expose `DescribeInstanceStatus` request outcomes. `controller_runtime_reconcile_errors_total` and reconciliation logs expose individual failed assessment scans, including reconciliations where one scan fails and the other reports impairment.
+
+`karpenter_interruption_instance_status_unhealthy_total` counts each uninterrupted instance-and-assessment occurrence once per controller process. A complete recovery scan allows a later impairment to count as a new occurrence. The deduplication cache is intentionally process-local: after restart, a still-active impairment may be counted again, and no auxiliary Kubernetes API state is written for metric continuity.
 
 ## Alternatives Considered
 

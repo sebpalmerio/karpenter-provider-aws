@@ -30,29 +30,43 @@ import (
 	"k8s.io/utils/clock"
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 
+	"github.com/aws/karpenter-provider-aws/pkg/apis"
 	instancestatusmsg "github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages/instancestatus"
 	awserrors "github.com/aws/karpenter-provider-aws/pkg/errors"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/utils"
 )
 
-// unhealthyKey uniquely identifies an unhealthy status check for deduplication.
-// The metric is only incremented the first time a given instance+category is observed.
+// unhealthyKey uniquely identifies an unhealthy status check for process-lifetime
+// deduplication. The metric is incremented once per uninterrupted occurrence in
+// this controller process.
 type unhealthyKey struct {
 	instanceID string
-	category   string
+	category   instancestatus.Category
 }
 
 type assessmentResult struct {
 	category instancestatus.Category
 	statuses map[string]instancestatus.HealthStatus
 	err      error
+}
+
+type scanResult struct {
+	assessment assessmentResult
+	err        error
+}
+
+type registeredNode struct {
+	instanceID string
+	node       *corev1.Node
 }
 
 var (
@@ -84,35 +98,68 @@ func NewInstanceStatusController(
 		},
 		instanceStatusProvider: instanceStatusProvider,
 		clk:                    clk,
-		seen:                   map[unhealthyKey]struct{}{},
+		seen:                   make(map[unhealthyKey]struct{}),
 	}
 }
 
 func (c *InstanceStatusController) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, "interruption.instancestatus")
 
-	instanceAssessment, instanceErr := c.scan(ctx, instancestatus.InstanceStatus)
-	systemAssessment, systemErr := c.scan(ctx, instancestatus.SystemStatus)
-	eventAssessment, eventErr := c.scan(ctx, instancestatus.EventStatus)
+	instanceAssessment, instanceErr, systemAssessment, systemErr := c.scanHealth(ctx)
 	observationTime := c.clk.Now()
+	eventAssessment, eventErr := c.scan(ctx, instancestatus.EventStatus)
 
-	currentKeys := map[unhealthyKey]struct{}{}
+	currentKeys := make(map[unhealthyKey]struct{})
+	processed := make(map[instancestatus.Category]struct{})
+	protected := make(map[unhealthyKey]struct{})
 	var errs error
-	if err := c.publishConditions(ctx, instanceAssessment, systemAssessment, observationTime, currentKeys); err != nil {
-		errs = multierr.Append(errs, err)
-	}
 	if eventAssessment.err == nil {
-		if err := c.handleEvents(ctx, eventAssessment, currentKeys); err != nil {
+		failedKeys, err := c.handleEvents(ctx, eventAssessment, currentKeys)
+		for key := range failedKeys {
+			protected[key] = struct{}{}
+		}
+		processed[eventAssessment.category] = struct{}{}
+		if err != nil {
 			errs = multierr.Append(errs, err)
 		}
 	}
-	c.pruneSeen(currentKeys, instanceAssessment, systemAssessment, eventAssessment)
+
+	healthObserved, err := c.publishConditions(ctx, instanceAssessment, systemAssessment, observationTime, currentKeys)
+	if err != nil {
+		errs = multierr.Append(errs, err)
+	}
+	if healthObserved {
+		for _, assessment := range []assessmentResult{instanceAssessment, systemAssessment} {
+			if assessment.err == nil {
+				processed[assessment.category] = struct{}{}
+			}
+		}
+	}
+
+	c.pruneSeen(currentKeys, processed, protected)
 
 	errs = multierr.Append(errs, multierr.Combine(instanceErr, systemErr, eventErr))
 	if errs != nil {
 		return reconciler.Result{}, errs
 	}
 	return reconciler.Result{RequeueAfter: InstanceStatusInterval}, nil
+}
+
+func (c *InstanceStatusController) scanHealth(ctx context.Context) (assessmentResult, error, assessmentResult, error) {
+	scan := func(category instancestatus.Category) <-chan scanResult {
+		results := make(chan scanResult, 1)
+		go func() {
+			assessment, err := c.scan(ctx, category)
+			results <- scanResult{assessment: assessment, err: err}
+		}()
+		return results
+	}
+
+	instanceResult := scan(instancestatus.InstanceStatus)
+	systemResult := scan(instancestatus.SystemStatus)
+	instanceAssessment := <-instanceResult
+	systemAssessment := <-systemResult
+	return instanceAssessment.assessment, instanceAssessment.err, systemAssessment.assessment, systemAssessment.err
 }
 
 func (c *InstanceStatusController) scan(ctx context.Context, category instancestatus.Category) (assessmentResult, error) {
@@ -124,9 +171,7 @@ func (c *InstanceStatusController) scan(ctx context.Context, category instancest
 	}
 	if err != nil {
 		if awserrors.IsUnauthorizedOperationError(err) {
-			log.FromContext(ctx).Error(err, "ec2:DescribeInstanceStatus permission is not allowed, update the IAM policy and restart the Karpenter deployment to enable instance status health checks",
-				"category", category)
-			return result, nil
+			return result, fmt.Errorf("ec2:DescribeInstanceStatus permission is not allowed for %s checks; grant the permission and Karpenter will retry automatically, %w", category, err)
 		}
 		return result, fmt.Errorf("getting EC2 %s checks, %w", category, err)
 	}
@@ -142,29 +187,27 @@ func (c *InstanceStatusController) publishConditions(
 	systemAssessment assessmentResult,
 	observationTime time.Time,
 	currentKeys map[unhealthyKey]struct{},
-) error {
-	nodesByInstanceID, err := c.registeredNodesByInstanceID(ctx)
-	if err != nil {
-		return fmt.Errorf("listing registered managed Nodes, %w", err)
-	}
-
+) (bool, error) {
 	instanceComplete := instanceAssessment.err == nil
 	systemComplete := systemAssessment.err == nil
 	if !instanceComplete && !systemComplete {
-		return nil
+		return true, nil
+	}
+	if (!instanceComplete && len(systemAssessment.statuses) == 0) ||
+		(!systemComplete && len(instanceAssessment.statuses) == 0) {
+		return true, nil
 	}
 
-	instanceIDs := make([]string, 0, len(nodesByInstanceID))
-	for instanceID := range nodesByInstanceID {
-		instanceIDs = append(instanceIDs, instanceID)
+	nodes, err := c.registeredNodes(ctx)
+	if err != nil {
+		return false, fmt.Errorf("listing registered managed Nodes, %w", err)
 	}
-	errs := make([]error, len(instanceIDs))
-	workqueue.ParallelizeUntil(ctx, 10, len(instanceIDs), func(i int) {
-		instanceID := instanceIDs[i]
-		node := nodesByInstanceID[instanceID]
-		errs[i] = c.publishCondition(ctx, node, instanceID, instanceAssessment, systemAssessment, observationTime, currentKeys)
+
+	errs := make([]error, len(nodes))
+	workqueue.ParallelizeUntil(ctx, 10, len(nodes), func(i int) {
+		errs[i] = c.publishCondition(ctx, nodes[i].node, nodes[i].instanceID, instanceAssessment, systemAssessment, observationTime, currentKeys)
 	})
-	return multierr.Combine(errs...)
+	return true, multierr.Combine(errs...)
 }
 
 func (c *InstanceStatusController) publishCondition(
@@ -206,15 +249,49 @@ func (c *InstanceStatusController) publishCondition(
 	return nil
 }
 
-func (c *InstanceStatusController) registeredNodesByInstanceID(ctx context.Context) (map[string]*corev1.Node, error) {
-	nodeClaims := &karpv1.NodeClaimList{}
-	if err := c.kubeClient.List(ctx, nodeClaims); err != nil {
-		return nil, err
+func (c *InstanceStatusController) registeredNodes(ctx context.Context) ([]registeredNode, error) {
+	type nodeClaimListResult struct {
+		list *karpv1.NodeClaimList
+		err  error
 	}
-	registeredInstanceIDs := map[string]struct{}{}
-	for i := range nodeClaims.Items {
-		nodeClaim := &nodeClaims.Items[i]
-		if !nodeClaim.StatusConditions().IsTrue(karpv1.ConditionTypeRegistered) {
+	type nodeListResult struct {
+		list *corev1.NodeList
+		err  error
+	}
+
+	nodeClaimsResult := make(chan nodeClaimListResult, 1)
+	go func() {
+		nodeClaims := &karpv1.NodeClaimList{}
+		err := c.kubeClient.List(ctx, nodeClaims, client.UnsafeDisableDeepCopy)
+		nodeClaimsResult <- nodeClaimListResult{list: nodeClaims, err: err}
+	}()
+	nodesResult := make(chan nodeListResult, 1)
+	go func() {
+		nodes := &corev1.NodeList{}
+		err := c.kubeClient.List(ctx, nodes, client.UnsafeDisableDeepCopy)
+		nodesResult <- nodeListResult{list: nodes, err: err}
+	}()
+
+	nodeClaims := <-nodeClaimsResult
+	nodes := <-nodesResult
+	if nodeClaims.err != nil {
+		return nil, nodeClaims.err
+	}
+	if nodes.err != nil {
+		return nil, nodes.err
+	}
+	return registeredNodesFor(nodeClaims.list.Items, nodes.list.Items), nil
+}
+
+func registeredNodesFor(nodeClaims []karpv1.NodeClaim, nodes []corev1.Node) []registeredNode {
+	registeredInstanceIDs := make(map[string]struct{}, len(nodeClaims))
+	registeredProviderIDs := make(map[string]string, len(nodeClaims))
+	for i := range nodeClaims {
+		nodeClaim := &nodeClaims[i]
+		if nodeClaim.Spec.NodeClassRef == nil ||
+			nodeClaim.Spec.NodeClassRef.Group != apis.Group ||
+			nodeClaim.Spec.NodeClassRef.Kind != "EC2NodeClass" ||
+			!nodeClaimIsRegistered(nodeClaim) {
 			continue
 		}
 		instanceID, err := utils.ParseInstanceID(nodeClaim.Status.ProviderID)
@@ -222,24 +299,35 @@ func (c *InstanceStatusController) registeredNodesByInstanceID(ctx context.Conte
 			continue
 		}
 		registeredInstanceIDs[instanceID] = struct{}{}
+		registeredProviderIDs[nodeClaim.Status.ProviderID] = instanceID
 	}
 
-	nodes := &corev1.NodeList{}
-	if err := c.kubeClient.List(ctx, nodes); err != nil {
-		return nil, err
-	}
-	nodesByInstanceID := map[string]*corev1.Node{}
-	for i := range nodes.Items {
-		node := &nodes.Items[i]
+	registeredNodes := make([]registeredNode, 0, min(len(nodes), len(registeredInstanceIDs)))
+	for i := range nodes {
+		node := &nodes[i]
+		if instanceID, ok := registeredProviderIDs[node.Spec.ProviderID]; ok {
+			registeredNodes = append(registeredNodes, registeredNode{instanceID: instanceID, node: node})
+			continue
+		}
 		instanceID, err := utils.ParseInstanceID(node.Spec.ProviderID)
 		if err != nil {
 			continue
 		}
 		if _, ok := registeredInstanceIDs[instanceID]; ok {
-			nodesByInstanceID[instanceID] = node
+			registeredNodes = append(registeredNodes, registeredNode{instanceID: instanceID, node: node})
 		}
 	}
-	return nodesByInstanceID, nil
+	return registeredNodes
+}
+
+func nodeClaimIsRegistered(nodeClaim *karpv1.NodeClaim) bool {
+	for i := range nodeClaim.Status.Conditions {
+		condition := &nodeClaim.Status.Conditions[i]
+		if condition.Type == karpv1.ConditionTypeRegistered {
+			return condition.Status == metav1.ConditionTrue
+		}
+	}
+	return false
 }
 
 func conditionForAssessments(
@@ -333,46 +421,60 @@ func conditionForType(node *corev1.Node, conditionType corev1.NodeConditionType)
 }
 
 func (c *InstanceStatusController) patchCondition(ctx context.Context, node *corev1.Node, condition corev1.NodeCondition) error {
-	stored := node.DeepCopy()
+	current := conditionForType(node, condition.Type)
+	if current != nil && equality.Semantic.DeepEqual(*current, condition) {
+		return nil
+	}
+
+	updated := node.DeepCopy()
 	replaced := false
-	for i := range node.Status.Conditions {
-		if node.Status.Conditions[i].Type == condition.Type {
-			node.Status.Conditions[i] = condition
+	for i := range updated.Status.Conditions {
+		if updated.Status.Conditions[i].Type == condition.Type {
+			updated.Status.Conditions[i] = condition
 			replaced = true
 			break
 		}
 	}
 	if !replaced {
-		node.Status.Conditions = append(node.Status.Conditions, condition)
+		updated.Status.Conditions = append(updated.Status.Conditions, condition)
 	}
-	if equality.Semantic.DeepEqual(stored.Status.Conditions, node.Status.Conditions) {
-		return nil
-	}
-	return client.IgnoreNotFound(c.kubeClient.Status().Patch(ctx, node, client.StrategicMergeFrom(stored)))
+	return client.IgnoreNotFound(c.kubeClient.Status().Patch(ctx, updated, client.StrategicMergeFrom(node)))
 }
 
-func (c *InstanceStatusController) handleEvents(ctx context.Context, assessment assessmentResult, currentKeys map[unhealthyKey]struct{}) error {
+func (c *InstanceStatusController) handleEvents(
+	ctx context.Context,
+	assessment assessmentResult,
+	currentKeys map[unhealthyKey]struct{},
+) (map[unhealthyKey]struct{}, error) {
 	statuses := make([]instancestatus.HealthStatus, 0, len(assessment.statuses))
 	for _, status := range assessment.statuses {
 		statuses = append(statuses, status)
 	}
 	errs := make([]error, len(statuses))
+	failedKeys := make([]unhealthyKey, len(statuses))
 	workqueue.ParallelizeUntil(ctx, 10, len(statuses), func(i int) {
 		healthStatus := statuses[i]
 		found, err := c.handleMessage(ctx, instancestatusmsg.New(healthStatus.InstanceID, healthStatus.ImpairedSince), false)
-		if err != nil {
-			errs[i] = fmt.Errorf("handling scheduled event message, %w", err)
-			return
-		}
 		if found {
 			c.recordUnhealthyInstance(ctx, healthStatus.InstanceID, instancestatus.EventStatus, currentKeys)
 		}
+		if err != nil {
+			errs[i] = fmt.Errorf("handling scheduled event message, %w", err)
+			failedKeys[i] = unhealthyKey{instanceID: healthStatus.InstanceID, category: instancestatus.EventStatus}
+			return
+		}
 	})
-	return multierr.Combine(errs...)
+	protected := make(map[unhealthyKey]struct{})
+	for i := range errs {
+		if errs[i] != nil {
+			protected[failedKeys[i]] = struct{}{}
+		}
+	}
+	return protected, multierr.Combine(errs...)
 }
 
 func (c *InstanceStatusController) recordUnhealthyInstance(ctx context.Context, instanceID string, category instancestatus.Category, currentKeys map[unhealthyKey]struct{}) {
-	key := unhealthyKey{instanceID: instanceID, category: string(category)}
+	key := unhealthyKey{instanceID: instanceID, category: category}
 	c.mu.Lock()
 	currentKeys[key] = struct{}{}
 	_, already := c.seen[key]
@@ -384,21 +486,22 @@ func (c *InstanceStatusController) recordUnhealthyInstance(ctx context.Context, 
 		log.FromContext(ctx).Info("detected unhealthy instance owned by cluster",
 			"instanceID", instanceID,
 			"category", string(category))
-		InstanceStatusUnhealthy.Inc(map[string]string{categoryLabel: string(category)})
+		InstanceStatusUnhealthy.Inc(map[string]string{Category.Name: instanceStatusMetricCategoryName(category)})
 	}
 }
 
-func (c *InstanceStatusController) pruneSeen(currentKeys map[unhealthyKey]struct{}, assessments ...assessmentResult) {
-	completed := map[string]struct{}{}
-	for _, assessment := range assessments {
-		if assessment.err == nil {
-			completed[string(assessment.category)] = struct{}{}
-		}
-	}
+func (c *InstanceStatusController) pruneSeen(
+	currentKeys map[unhealthyKey]struct{},
+	processed map[instancestatus.Category]struct{},
+	protected map[unhealthyKey]struct{},
+) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for key := range c.seen {
-		if _, ok := completed[key.category]; !ok {
+		if _, ok := processed[key.category]; !ok {
+			continue
+		}
+		if _, ok := protected[key]; ok {
 			continue
 		}
 		if _, ok := currentKeys[key]; !ok {
@@ -411,5 +514,12 @@ func (c *InstanceStatusController) Register(_ context.Context, m manager.Manager
 	return controllerruntime.NewControllerManagedBy(m).
 		Named("interruption.instancestatus").
 		WatchesRawSource(singleton.Source()).
+		WithOptions(controller.Options{
+			RateLimiter: instanceStatusRateLimiter(),
+		}).
 		Complete(singleton.AsReconciler(c))
+}
+
+func instanceStatusRateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
+	return workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](InstanceStatusInterval, InstanceStatusInterval)
 }

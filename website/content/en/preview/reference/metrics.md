@@ -64,6 +64,7 @@ The number of nodes consuming the budget of a nodepool at a point in time. Label
     - `underutilized` — The node was underutilized.
     - `empty` — The node had no workload pods.
     - `drifted` — The node drifted from its desired specification.
+    - `unhealthy` — The node failed a node-repair health check.
 
 ### `karpenter_nodepools_limit`
 Limits specified on the nodepool that restrict the quantity of resources provisioned. Labeled by nodepool name and resource type.
@@ -97,15 +98,16 @@ The number of nodes for a given NodePool that can be concurrently disrupting at 
     - `underutilized` — The node was underutilized.
     - `empty` — The node had no workload pods.
     - `drifted` — The node drifted from its desired specification.
+    - `unhealthy` — The node failed a node-repair health check.
 
 ## Nodeclaims Metrics
 
 ### `karpenter_nodeclaims_unhealthy_disrupted_total`
-Number of unhealthy nodeclaims disrupted in total by Karpenter. Labeled by the condition the node was disrupted on, the owning nodepool, the capacity type, and the image ID.
+Number of unhealthy nodeclaims disrupted in total by node repair. Labeled by the condition the node was disrupted on, the owning nodepool, the capacity type, and the image ID.
 - Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
 - Stability Level: ALPHA
 - Dimensions:
-  - `condition` — The node status condition type that failed the repair health check and triggered disruption.
+  - `condition` — The node status condition type that triggered node repair disruption.
   - `nodepool` — The name of the NodePool that owns the resource.
   - `capacity_type` — The capacity type of the instance.
     - `on-demand` — On-demand capacity.
@@ -161,8 +163,6 @@ Number of nodeclaims disrupted in total by Karpenter. Labeled by reason the node
     - `instance_stopped` — The EC2 instance was stopped.
     - `instance_terminated` — The EC2 instance was terminated.
     - `capacity_reservation_interrupted` — The instance's capacity reservation was interrupted.
-    - `instance_status` — An EC2 instance status check reported the instance unhealthy.
-    - `system_status` — An EC2 system status check reported the instance's host unhealthy.
     - `event_status` — An EC2 scheduled-event status check fired for the instance.
   - `nodepool` — The name of the NodePool that owns the resource.
   - `capacity_type` — The capacity type of the instance.
@@ -188,6 +188,7 @@ Number of nodeclaims created in total by Karpenter. Labeled by reason the nodecl
     - `underutilized` — The node was underutilized.
     - `empty` — The node had no workload pods.
     - `drifted` — The node drifted from its desired specification.
+    - `unhealthy` — The node failed a node-repair health check.
   - `nodepool` — The name of the NodePool that owns the resource.
   - `min_values_relaxed` — Whether minValues requirements were relaxed to satisfy scheduling.
     - `true`
@@ -688,6 +689,7 @@ The number of times that an enqueued disruption decision failed. Labeled by disr
     - `underutilized` — The node was underutilized.
     - `empty` — The node had no workload pods.
     - `drifted` — The node drifted from its desired specification.
+    - `unhealthy` — The node failed a node-repair health check.
   - `consolidation_type` — The consolidation algorithm that produced the decision.
     - `multi` — Consolidation that considers removing multiple nodes at once.
     - `single` — Consolidation that considers removing a single node.
@@ -712,6 +714,7 @@ Number of nodes eligible for disruption by Karpenter. Labeled by disruption reas
     - `underutilized` — The node was underutilized.
     - `empty` — The node had no workload pods.
     - `drifted` — The node drifted from its desired specification.
+    - `unhealthy` — The node failed a node-repair health check.
 
 ### `karpenter_voluntary_disruption_decisions_total`
 Number of disruption decisions performed. Labeled by disruption decision, reason, and consolidation type.
@@ -726,6 +729,7 @@ Number of disruption decisions performed. Labeled by disruption decision, reason
     - `underutilized` — The node was underutilized.
     - `empty` — The node had no workload pods.
     - `drifted` — The node drifted from its desired specification.
+    - `unhealthy` — The node failed a node-repair health check.
   - `consolidation_type` — The consolidation algorithm that produced the decision.
     - `multi` — Consolidation that considers removing multiple nodes at once.
     - `single` — Consolidation that considers removing a single node.
@@ -745,6 +749,7 @@ Number of disruption decisions performed by nodepool. Labeled by nodepool name, 
     - `underutilized` — The node was underutilized.
     - `empty` — The node had no workload pods.
     - `drifted` — The node drifted from its desired specification.
+    - `unhealthy` — The node failed a node-repair health check.
   - `consolidation_type` — The consolidation algorithm that produced the decision.
     - `multi` — Consolidation that considers removing multiple nodes at once.
     - `single` — Consolidation that considers removing a single node.
@@ -759,6 +764,7 @@ Duration of the disruption decision evaluation process in seconds. Labeled by me
     - `underutilized` — The node was underutilized.
     - `empty` — The node had no workload pods.
     - `drifted` — The node drifted from its desired specification.
+    - `unhealthy` — The node failed a node-repair health check.
   - `consolidation_type` — The consolidation algorithm that produced the decision.
     - `multi` — Consolidation that considers removing multiple nodes at once.
     - `single` — Consolidation that considers removing a single node.
@@ -833,9 +839,6 @@ Count of messages received from the SQS queue. Broken down by message type and w
     - `instance_stopped` — The EC2 instance was stopped.
     - `instance_terminated` — The EC2 instance was terminated.
     - `capacity_reservation_interrupted` — The instance's capacity reservation was interrupted.
-    - `instance_status` — An EC2 instance status check reported the instance unhealthy.
-    - `system_status` — An EC2 system status check reported the instance's host unhealthy.
-    - `event_status` — An EC2 scheduled-event status check fired for the instance.
 
 ### `karpenter_interruption_message_queue_duration_seconds`
 Amount of time an interruption message is on the queue before it is processed by karpenter.
@@ -843,7 +846,7 @@ Amount of time an interruption message is on the queue before it is processed by
 - Stability Level: STABLE
 
 ### `karpenter_interruption_instance_status_unhealthy_total`
-Count of unique unhealthy instance statuses detected from EC2 DescribeInstanceStatus. Broken down by status check category.
+Count of unhealthy EC2 instance status occurrences detected during this controller process. Broken down by status check category.
 - Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
 - Stability Level: STABLE
 - Dimensions:

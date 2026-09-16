@@ -17,7 +17,6 @@ package instancestatus
 import (
 	"context"
 	"fmt"
-	"slices"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -97,7 +96,7 @@ func (p DefaultProvider) List(ctx context.Context, category Category) ([]HealthS
 	if !ok {
 		return nil, fmt.Errorf("unsupported EC2 instance status category %q", category)
 	}
-	var statuses []ec2types.InstanceStatus
+	var healthStatuses []HealthStatus
 	pager := ec2.NewDescribeInstanceStatusPaginator(p.ec2api, &ec2.DescribeInstanceStatusInput{
 		Filters: filters,
 	})
@@ -106,25 +105,33 @@ func (p DefaultProvider) List(ctx context.Context, category Category) ([]HealthS
 		if err != nil {
 			return nil, fmt.Errorf("describing EC2 %s checks, %w", category, err)
 		}
-		statuses = append(statuses, out.InstanceStatuses...)
-	}
-
-	var healthStatuses []HealthStatus
-	for _, statusChecks := range statuses {
-		healthStatus := p.newHealthStatus(statusChecks, category)
-		healthStatus.Details = lo.Filter(healthStatus.Details, func(details Details, _ int) bool {
-			return details.Status == ec2types.StatusTypeFailed &&
-				(details.Category == EventStatus || details.Name == string(ec2types.StatusNameReachability))
-		})
-		if len(healthStatus.Details) == 0 {
-			continue
+		for _, statusChecks := range out.InstanceStatuses {
+			healthStatus := p.newHealthStatus(statusChecks, category)
+			healthStatus.Details = lo.Filter(healthStatus.Details, func(details Details, _ int) bool {
+				return details.Status == ec2types.StatusTypeFailed &&
+					(details.Category == EventStatus || details.Name == string(ec2types.StatusNameReachability))
+			})
+			if len(healthStatus.Details) == 0 {
+				continue
+			}
+			healthStatus.ImpairedSince = earliestImpairedSince(healthStatus.Details)
+			healthStatuses = append(healthStatuses, healthStatus)
 		}
-		healthStatus.ImpairedSince = slices.MinFunc(healthStatus.Details, func(a, b Details) int {
-			return a.ImpairedSince.Compare(b.ImpairedSince)
-		}).ImpairedSince
-		healthStatuses = append(healthStatuses, healthStatus)
 	}
 	return healthStatuses, nil
+}
+
+func earliestImpairedSince(details []Details) time.Time {
+	var earliest time.Time
+	for _, detail := range details {
+		if detail.ImpairedSince.IsZero() {
+			continue
+		}
+		if earliest.IsZero() || detail.ImpairedSince.Before(earliest) {
+			earliest = detail.ImpairedSince
+		}
+	}
+	return earliest
 }
 
 // newHealthStatus constructs a more consumable version of Health Status Details from the different status checks
