@@ -47,6 +47,7 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/apis"
 	v1 "github.com/aws/karpenter-provider-aws/pkg/apis/v1"
 	awscache "github.com/aws/karpenter-provider-aws/pkg/cache"
+	statuscontroller "github.com/aws/karpenter-provider-aws/pkg/controllers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages/capacityreservationinterruption"
@@ -81,7 +82,8 @@ var sqsProvider *sqs.DefaultProvider
 var unavailableOfferingsCache *awscache.UnavailableOfferings
 var fakeClock *clock.FakeClock
 var controller *interruption.Controller
-var instanceStatusController *interruption.InstanceStatusController
+var eventStatusController *interruption.ScheduledEventController
+var instanceStatusController *statuscontroller.Controller
 
 type nodeClaimListFailureClient struct {
 	client.Client
@@ -110,7 +112,8 @@ var _ = BeforeSuite(func() {
 	sqsapi = &fake.SQSAPI{}
 	sqsProvider = lo.Must(sqs.NewDefaultProvider(sqsapi, fmt.Sprintf("https://sqs.%s.amazonaws.com/%s/test-cluster", fake.DefaultRegion, fake.DefaultAccount)))
 	controller = interruption.NewController(env.Client, events.NewRecorder(&record.FakeRecorder{}), sqsProvider, servicesqs.NewFromConfig(aws.Config{}), unavailableOfferingsCache, awsEnv.CapacityReservationProvider)
-	instanceStatusController = interruption.NewInstanceStatusController(env.Client, fakeClock, events.NewRecorder(&record.FakeRecorder{}), awsEnv.InstanceStatusProvider)
+	eventStatusController = interruption.NewScheduledEventController(env.Client, events.NewRecorder(&record.FakeRecorder{}), awsEnv.InstanceStatusProvider)
+	instanceStatusController = statuscontroller.NewController(env.Client, fakeClock, awsEnv.InstanceStatusProvider)
 })
 
 var _ = AfterSuite(func() {
@@ -124,7 +127,7 @@ var _ = BeforeEach(func() {
 	sqsapi.Reset()
 	awsEnv.EC2API.DescribeInstanceStatusBehavior.Reset()
 	awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{})
-	interruption.InstanceStatusUnhealthy.Reset()
+	instancestatus.UnhealthyTotal.Reset()
 })
 
 var _ = AfterEach(func() {
@@ -364,7 +367,7 @@ var _ = Describe("InterruptionHandling", func() {
 			awsEnv.Clock.Step(time.Hour)
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
 				"category": "SystemStatus",
 			})
 			ExpectExists(ctx, env.Client, nodeClaim)
@@ -393,7 +396,7 @@ var _ = Describe("InterruptionHandling", func() {
 			awsEnv.Clock.Step(time.Hour)
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
 				"category": "InstanceStatus",
 			})
 			ExpectExists(ctx, env.Client, nodeClaim)
@@ -442,7 +445,7 @@ var _ = Describe("InterruptionHandling", func() {
 				},
 			})
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
-			ExpectSingletonReconciled(ctx, instanceStatusController)
+			ExpectSingletonReconciled(ctx, eventStatusController)
 			// NodeClaim should still exist due to finalizer, but have a DeletionTimestamp
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeFalse())
@@ -476,6 +479,7 @@ var _ = Describe("InterruptionHandling", func() {
 			awsEnv.Clock.Step(time.Hour)
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectSingletonReconciled(ctx, instanceStatusController)
+			ExpectSingletonReconciled(ctx, eventStatusController)
 			nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
 			Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeFalse())
 			Expect(nodeClaim.Annotations).ToNot(HaveKey(karpv1.NodeClaimTerminationTimestampAnnotationKey))
@@ -528,12 +532,12 @@ var _ = Describe("InterruptionHandling", func() {
 				},
 			})
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
-			ExpectSingletonReconciled(ctx, instanceStatusController)
+			ExpectSingletonReconciled(ctx, eventStatusController)
 			ExpectMetricCounterValue(metrics.NodeClaimsDisruptedTotal, 1, map[string]string{
 				metrics.ReasonLabel: "event_status",
 				"nodepool":          "default",
 			})
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
 				"category": "EventStatus",
 			})
 			ExpectNotFound(ctx, env.Client, nodeClaim)
@@ -560,7 +564,7 @@ var _ = Describe("InterruptionHandling", func() {
 			awsEnv.Clock.Step(time.Hour)
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
 				"category": "InstanceStatus",
 			})
 			ExpectExists(ctx, env.Client, nodeClaim)
@@ -588,10 +592,9 @@ var _ = Describe("InterruptionHandling", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 
 			failingClient := &nodeClaimListFailureClient{Client: env.Client}
-			retryingController := interruption.NewInstanceStatusController(
+			retryingController := statuscontroller.NewController(
 				failingClient,
 				fakeClock,
-				events.NewRecorder(&record.FakeRecorder{}),
 				awsEnv.InstanceStatusProvider,
 			)
 
@@ -600,7 +603,7 @@ var _ = Describe("InterruptionHandling", func() {
 			_ = ExpectSingletonReconcileFailed(ctx, retryingController)
 			ExpectSingletonReconciled(ctx, retryingController)
 
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
 				"category": "InstanceStatus",
 			})
 		})
@@ -655,13 +658,13 @@ var _ = Describe("InterruptionHandling", func() {
 
 			// First reconcile should count both instances
 			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 2, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 2, map[string]string{
 				"category": "InstanceStatus",
 			})
 
 			// Second reconcile should not increment further
 			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 2, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 2, map[string]string{
 				"category": "InstanceStatus",
 			})
 		})
@@ -690,7 +693,7 @@ var _ = Describe("InterruptionHandling", func() {
 
 			// First reconcile detects the unhealthy instance
 			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
 				"category": "InstanceStatus",
 			})
 
@@ -722,7 +725,7 @@ var _ = Describe("InterruptionHandling", func() {
 			ExpectSingletonReconciled(ctx, instanceStatusController)
 
 			// Metric should now be 2 (counted once for each occurrence)
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 2, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 2, map[string]string{
 				"category": "InstanceStatus",
 			})
 		})
@@ -748,18 +751,17 @@ var _ = Describe("InterruptionHandling", func() {
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 
 			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
 				"category": "InstanceStatus",
 			})
 
-			restartedController := interruption.NewInstanceStatusController(
+			restartedController := statuscontroller.NewController(
 				env.Client,
 				fakeClock,
-				events.NewRecorder(&record.FakeRecorder{}),
 				awsEnv.InstanceStatusProvider,
 			)
 			ExpectSingletonReconciled(ctx, restartedController)
-			ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 2, map[string]string{
+			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 2, map[string]string{
 				"category": "InstanceStatus",
 			})
 		})

@@ -28,6 +28,7 @@ import (
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	"github.com/aws/karpenter-provider-aws/pkg/apis"
+	statuscontroller "github.com/aws/karpenter-provider-aws/pkg/controllers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 
@@ -39,7 +40,6 @@ import (
 type instanceStatusProvider struct {
 	statuses map[instancestatus.Category][]instancestatus.HealthStatus
 	errors   map[instancestatus.Category]error
-	hooks    map[instancestatus.Category]func()
 }
 
 type nodeClaimDeleteErrorClient struct {
@@ -54,9 +54,6 @@ func (c *nodeClaimDeleteErrorClient) Delete(ctx context.Context, object client.O
 }
 
 func (p *instanceStatusProvider) List(_ context.Context, category instancestatus.Category) ([]instancestatus.HealthStatus, error) {
-	if hook := p.hooks[category]; hook != nil {
-		hook()
-	}
 	if err := p.errors[category]; err != nil {
 		return nil, err
 	}
@@ -67,7 +64,7 @@ var _ = Describe("EC2 Status Conditions", func() {
 	var nodeClaim *karpv1.NodeClaim
 	var node *corev1.Node
 	var provider *instanceStatusProvider
-	var statusController *interruption.InstanceStatusController
+	var statusController *statuscontroller.Controller
 	var instanceID string
 
 	BeforeEach(func() {
@@ -75,12 +72,10 @@ var _ = Describe("EC2 Status Conditions", func() {
 		provider = &instanceStatusProvider{
 			statuses: map[instancestatus.Category][]instancestatus.HealthStatus{},
 			errors:   map[instancestatus.Category]error{},
-			hooks:    map[instancestatus.Category]func(){},
 		}
-		statusController = interruption.NewInstanceStatusController(
+		statusController = statuscontroller.NewController(
 			env.Client,
 			fakeClock,
-			events.NewRecorder(&record.FakeRecorder{}),
 			provider,
 		)
 		nodeClaim, node = coretest.NodeClaimAndNode(karpv1.NodeClaim{
@@ -159,21 +154,6 @@ var _ = Describe("EC2 Status Conditions", func() {
 		node = ExpectExists(ctx, env.Client, node)
 		condition := ExpectEC2StatusCondition(node, corev1.ConditionFalse, instancestatus.ReasonNoImpairmentReported)
 		Expect(condition.LastTransitionTime.Time.Equal(fakeClock.Now())).To(BeTrue())
-	})
-
-	It("captures health observation time before independently polling scheduled events", func() {
-		observationTime := fakeClock.Now()
-		provider.hooks[instancestatus.EventStatus] = func() {
-			fakeClock.Step(10 * time.Minute)
-		}
-		ExpectApplied(ctx, env.Client, nodeClaim, node)
-
-		ExpectSingletonReconciled(ctx, statusController)
-
-		node = ExpectExists(ctx, env.Client, node)
-		condition := ExpectEC2StatusCondition(node, corev1.ConditionFalse, instancestatus.ReasonNoImpairmentReported)
-		Expect(condition.LastTransitionTime.Time.Equal(observationTime)).To(BeTrue())
-		Expect(fakeClock.Now()).To(Equal(observationTime.Add(10 * time.Minute)))
 	})
 
 	It("publishes false when the first complete assessment reports no impairment", func() {
@@ -283,17 +263,16 @@ var _ = Describe("EC2 Status Conditions", func() {
 			InstanceID:    instanceID,
 			ImpairedSince: fakeClock.Now(),
 		}}
-		statusController = interruption.NewInstanceStatusController(
+		eventController := interruption.NewScheduledEventController(
 			&nodeClaimDeleteErrorClient{Client: env.Client},
-			fakeClock,
 			events.NewRecorder(&record.FakeRecorder{}),
 			provider,
 		)
 		ExpectApplied(ctx, env.Client, nodeClaim, node)
 
-		_ = ExpectSingletonReconcileFailed(ctx, statusController)
+		_ = ExpectSingletonReconcileFailed(ctx, eventController)
 
-		ExpectMetricCounterValue(interruption.InstanceStatusUnhealthy, 1, map[string]string{
+		ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
 			"category": "EventStatus",
 		})
 	})

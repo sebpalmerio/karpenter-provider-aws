@@ -12,7 +12,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package interruption
+package instancestatus
 
 import (
 	"context"
@@ -35,27 +35,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 
 	"github.com/aws/karpenter-provider-aws/pkg/apis"
-	instancestatusmsg "github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages/instancestatus"
 	awserrors "github.com/aws/karpenter-provider-aws/pkg/errors"
-	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
+	instancestatusprovider "github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/utils"
 )
 
-// unhealthyKey uniquely identifies an unhealthy status check for process-lifetime
-// deduplication. The metric is incremented once per uninterrupted occurrence in
-// this controller process.
+const reconcileInterval = time.Minute
+
 type unhealthyKey struct {
 	instanceID string
-	category   instancestatus.Category
+	category   instancestatusprovider.Category
 }
 
 type assessmentResult struct {
-	category instancestatus.Category
-	statuses map[string]instancestatus.HealthStatus
+	category instancestatusprovider.Category
+	statuses map[string]instancestatusprovider.HealthStatus
 	err      error
 }
 
@@ -69,84 +66,50 @@ type registeredNode struct {
 	node       *corev1.Node
 }
 
-var (
-	// InstanceStatusInterval is the polling interval for the EC2 DescribeInstanceStatus API.
-	InstanceStatusInterval = 1 * time.Minute
-)
-
-// InstanceStatusController polls EC2 DescribeInstanceStatus. Instance-status and
-// system-status diagnoses are published as Node health, while scheduled events
-// continue through interruption handling.
-type InstanceStatusController struct {
-	InterruptionHandler
-	instanceStatusProvider instancestatus.Provider
-	clk                    clock.Clock
-	seen                   map[unhealthyKey]struct{}
-	mu                     sync.Mutex
+// Controller publishes EC2 instance and system reachability assessments as Node health.
+type Controller struct {
+	kubeClient client.Client
+	provider   instancestatusprovider.Provider
+	clock      clock.Clock
+	seen       map[unhealthyKey]struct{}
+	mu         sync.Mutex
 }
 
-func NewInstanceStatusController(
-	kubeClient client.Client,
-	clk clock.Clock,
-	recorder events.Recorder,
-	instanceStatusProvider instancestatus.Provider,
-) *InstanceStatusController {
-	return &InstanceStatusController{
-		InterruptionHandler: InterruptionHandler{
-			kubeClient: kubeClient,
-			recorder:   recorder,
-		},
-		instanceStatusProvider: instanceStatusProvider,
-		clk:                    clk,
-		seen:                   make(map[unhealthyKey]struct{}),
+func NewController(kubeClient client.Client, clk clock.Clock, provider instancestatusprovider.Provider) *Controller {
+	return &Controller{
+		kubeClient: kubeClient,
+		provider:   provider,
+		clock:      clk,
+		seen:       make(map[unhealthyKey]struct{}),
 	}
 }
 
-func (c *InstanceStatusController) Reconcile(ctx context.Context) (reconciler.Result, error) {
-	ctx = injection.WithControllerName(ctx, "interruption.instancestatus")
+func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
+	ctx = injection.WithControllerName(ctx, "instancestatus")
 
 	instanceAssessment, instanceErr, systemAssessment, systemErr := c.scanHealth(ctx)
-	observationTime := c.clk.Now()
-	eventAssessment, eventErr := c.scan(ctx, instancestatus.EventStatus)
-
+	observationTime := c.clock.Now()
 	currentKeys := make(map[unhealthyKey]struct{})
-	processed := make(map[instancestatus.Category]struct{})
-	protected := make(map[unhealthyKey]struct{})
-	var errs error
-	if eventAssessment.err == nil {
-		failedKeys, err := c.handleEvents(ctx, eventAssessment, currentKeys)
-		for key := range failedKeys {
-			protected[key] = struct{}{}
-		}
-		processed[eventAssessment.category] = struct{}{}
-		if err != nil {
-			errs = multierr.Append(errs, err)
-		}
-	}
 
-	healthObserved, err := c.publishConditions(ctx, instanceAssessment, systemAssessment, observationTime, currentKeys)
-	if err != nil {
-		errs = multierr.Append(errs, err)
-	}
-	if healthObserved {
+	canPrune, err := c.publishConditions(ctx, instanceAssessment, systemAssessment, observationTime, currentKeys)
+	if canPrune {
+		processed := make(map[instancestatusprovider.Category]struct{}, 2)
 		for _, assessment := range []assessmentResult{instanceAssessment, systemAssessment} {
 			if assessment.err == nil {
 				processed[assessment.category] = struct{}{}
 			}
 		}
+		c.pruneSeen(currentKeys, processed)
 	}
 
-	c.pruneSeen(currentKeys, processed, protected)
-
-	errs = multierr.Append(errs, multierr.Combine(instanceErr, systemErr, eventErr))
-	if errs != nil {
+	if errs := multierr.Combine(err, instanceErr, systemErr); errs != nil {
 		return reconciler.Result{}, errs
 	}
-	return reconciler.Result{RequeueAfter: InstanceStatusInterval}, nil
+	return reconciler.Result{RequeueAfter: reconcileInterval}, nil
 }
 
-func (c *InstanceStatusController) scanHealth(ctx context.Context) (assessmentResult, error, assessmentResult, error) {
-	scan := func(category instancestatus.Category) <-chan scanResult {
+func (c *Controller) scanHealth(ctx context.Context) (assessmentResult, error, assessmentResult, error) {
+	scan := func(category instancestatusprovider.Category) <-chan scanResult {
 		results := make(chan scanResult, 1)
 		go func() {
 			assessment, err := c.scan(ctx, category)
@@ -155,18 +118,18 @@ func (c *InstanceStatusController) scanHealth(ctx context.Context) (assessmentRe
 		return results
 	}
 
-	instanceResult := scan(instancestatus.InstanceStatus)
-	systemResult := scan(instancestatus.SystemStatus)
+	instanceResult := scan(instancestatusprovider.InstanceStatus)
+	systemResult := scan(instancestatusprovider.SystemStatus)
 	instanceAssessment := <-instanceResult
 	systemAssessment := <-systemResult
 	return instanceAssessment.assessment, instanceAssessment.err, systemAssessment.assessment, systemAssessment.err
 }
 
-func (c *InstanceStatusController) scan(ctx context.Context, category instancestatus.Category) (assessmentResult, error) {
-	statuses, err := c.instanceStatusProvider.List(ctx, category)
+func (c *Controller) scan(ctx context.Context, category instancestatusprovider.Category) (assessmentResult, error) {
+	statuses, err := c.provider.List(ctx, category)
 	result := assessmentResult{
 		category: category,
-		statuses: map[string]instancestatus.HealthStatus{},
+		statuses: map[string]instancestatusprovider.HealthStatus{},
 		err:      err,
 	}
 	if err != nil {
@@ -181,7 +144,7 @@ func (c *InstanceStatusController) scan(ctx context.Context, category instancest
 	return result, nil
 }
 
-func (c *InstanceStatusController) publishConditions(
+func (c *Controller) publishConditions(
 	ctx context.Context,
 	instanceAssessment assessmentResult,
 	systemAssessment assessmentResult,
@@ -210,7 +173,7 @@ func (c *InstanceStatusController) publishConditions(
 	return true, multierr.Combine(errs...)
 }
 
-func (c *InstanceStatusController) publishCondition(
+func (c *Controller) publishCondition(
 	ctx context.Context,
 	node *corev1.Node,
 	instanceID string,
@@ -222,10 +185,10 @@ func (c *InstanceStatusController) publishCondition(
 	instanceHealth, instanceImpaired := instanceAssessment.statuses[instanceID]
 	systemHealth, systemImpaired := systemAssessment.statuses[instanceID]
 	if instanceImpaired {
-		c.recordUnhealthyInstance(ctx, instanceID, instancestatus.InstanceStatus, currentKeys)
+		c.recordUnhealthyInstance(ctx, instanceID, instancestatusprovider.InstanceStatus, currentKeys)
 	}
 	if systemImpaired {
-		c.recordUnhealthyInstance(ctx, instanceID, instancestatus.SystemStatus, currentKeys)
+		c.recordUnhealthyInstance(ctx, instanceID, instancestatusprovider.SystemStatus, currentKeys)
 	}
 
 	instanceComplete := instanceAssessment.err == nil
@@ -249,7 +212,7 @@ func (c *InstanceStatusController) publishCondition(
 	return nil
 }
 
-func (c *InstanceStatusController) registeredNodes(ctx context.Context) ([]registeredNode, error) {
+func (c *Controller) registeredNodes(ctx context.Context) ([]registeredNode, error) {
 	type nodeClaimListResult struct {
 		list *karpv1.NodeClaimList
 		err  error
@@ -332,32 +295,32 @@ func nodeClaimIsRegistered(nodeClaim *karpv1.NodeClaim) bool {
 
 func conditionForAssessments(
 	node *corev1.Node,
-	instanceHealth instancestatus.HealthStatus,
+	instanceHealth instancestatusprovider.HealthStatus,
 	instanceImpaired bool,
 	instanceComplete bool,
-	systemHealth instancestatus.HealthStatus,
+	systemHealth instancestatusprovider.HealthStatus,
 	systemImpaired bool,
 	systemComplete bool,
 	observationTime time.Time,
 ) corev1.NodeCondition {
 	status := corev1.ConditionFalse
-	reason := instancestatus.ReasonNoImpairmentReported
+	reason := instancestatusprovider.ReasonNoImpairmentReported
 	message := "EC2 reports no recognized instance or system reachability impairment."
 	transitionTime := observationTime
 	if instanceImpaired || systemImpaired {
 		status = corev1.ConditionTrue
-		reason = instancestatus.ReasonReachabilityFailed
+		reason = instancestatusprovider.ReasonReachabilityFailed
 		message = impairmentMessage(instanceImpaired, instanceComplete, systemImpaired, systemComplete)
 		transitionTime = earliestImpairedSince(observationTime, instanceHealth, instanceImpaired, systemHealth, systemImpaired)
 	}
 
-	current := conditionForType(node, instancestatus.ConditionTypeEC2StatusImpaired)
+	current := conditionForType(node, instancestatusprovider.ConditionTypeEC2StatusImpaired)
 	if current != nil && current.Status == status {
 		transitionTime = current.LastTransitionTime.Time
 		reason = current.Reason
 	}
 	return corev1.NodeCondition{
-		Type:               instancestatus.ConditionTypeEC2StatusImpaired,
+		Type:               instancestatusprovider.ConditionTypeEC2StatusImpaired,
 		Status:             status,
 		LastTransitionTime: metav1.Time{Time: transitionTime},
 		Reason:             reason,
@@ -386,15 +349,15 @@ func impairmentMessage(instanceImpaired, instanceComplete, systemImpaired, syste
 
 func earliestImpairedSince(
 	fallback time.Time,
-	instanceHealth instancestatus.HealthStatus,
+	instanceHealth instancestatusprovider.HealthStatus,
 	instanceImpaired bool,
-	systemHealth instancestatus.HealthStatus,
+	systemHealth instancestatusprovider.HealthStatus,
 	systemImpaired bool,
 ) time.Time {
 	earliest := fallback
 	found := false
 	for _, health := range []struct {
-		status   instancestatus.HealthStatus
+		status   instancestatusprovider.HealthStatus
 		impaired bool
 	}{
 		{status: instanceHealth, impaired: instanceImpaired},
@@ -420,7 +383,7 @@ func conditionForType(node *corev1.Node, conditionType corev1.NodeConditionType)
 	return nil
 }
 
-func (c *InstanceStatusController) patchCondition(ctx context.Context, node *corev1.Node, condition corev1.NodeCondition) error {
+func (c *Controller) patchCondition(ctx context.Context, node *corev1.Node, condition corev1.NodeCondition) error {
 	current := conditionForType(node, condition.Type)
 	if current != nil && equality.Semantic.DeepEqual(*current, condition) {
 		return nil
@@ -441,39 +404,12 @@ func (c *InstanceStatusController) patchCondition(ctx context.Context, node *cor
 	return client.IgnoreNotFound(c.kubeClient.Status().Patch(ctx, updated, client.StrategicMergeFrom(node)))
 }
 
-func (c *InstanceStatusController) handleEvents(
+func (c *Controller) recordUnhealthyInstance(
 	ctx context.Context,
-	assessment assessmentResult,
+	instanceID string,
+	category instancestatusprovider.Category,
 	currentKeys map[unhealthyKey]struct{},
-) (map[unhealthyKey]struct{}, error) {
-	statuses := make([]instancestatus.HealthStatus, 0, len(assessment.statuses))
-	for _, status := range assessment.statuses {
-		statuses = append(statuses, status)
-	}
-	errs := make([]error, len(statuses))
-	failedKeys := make([]unhealthyKey, len(statuses))
-	workqueue.ParallelizeUntil(ctx, 10, len(statuses), func(i int) {
-		healthStatus := statuses[i]
-		found, err := c.handleMessage(ctx, instancestatusmsg.New(healthStatus.InstanceID, healthStatus.ImpairedSince), false)
-		if found {
-			c.recordUnhealthyInstance(ctx, healthStatus.InstanceID, instancestatus.EventStatus, currentKeys)
-		}
-		if err != nil {
-			errs[i] = fmt.Errorf("handling scheduled event message, %w", err)
-			failedKeys[i] = unhealthyKey{instanceID: healthStatus.InstanceID, category: instancestatus.EventStatus}
-			return
-		}
-	})
-	protected := make(map[unhealthyKey]struct{})
-	for i := range errs {
-		if errs[i] != nil {
-			protected[failedKeys[i]] = struct{}{}
-		}
-	}
-	return protected, multierr.Combine(errs...)
-}
-
-func (c *InstanceStatusController) recordUnhealthyInstance(ctx context.Context, instanceID string, category instancestatus.Category, currentKeys map[unhealthyKey]struct{}) {
+) {
 	key := unhealthyKey{instanceID: instanceID, category: category}
 	c.mu.Lock()
 	currentKeys[key] = struct{}{}
@@ -486,22 +422,15 @@ func (c *InstanceStatusController) recordUnhealthyInstance(ctx context.Context, 
 		log.FromContext(ctx).Info("detected unhealthy instance owned by cluster",
 			"instanceID", instanceID,
 			"category", string(category))
-		InstanceStatusUnhealthy.Inc(map[string]string{Category.Name: instanceStatusMetricCategoryName(category)})
+		instancestatusprovider.UnhealthyTotal.Inc(map[string]string{instancestatusprovider.CategoryLabel.Name: string(category)})
 	}
 }
 
-func (c *InstanceStatusController) pruneSeen(
-	currentKeys map[unhealthyKey]struct{},
-	processed map[instancestatus.Category]struct{},
-	protected map[unhealthyKey]struct{},
-) {
+func (c *Controller) pruneSeen(currentKeys map[unhealthyKey]struct{}, processed map[instancestatusprovider.Category]struct{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for key := range c.seen {
 		if _, ok := processed[key.category]; !ok {
-			continue
-		}
-		if _, ok := protected[key]; ok {
 			continue
 		}
 		if _, ok := currentKeys[key]; !ok {
@@ -510,16 +439,16 @@ func (c *InstanceStatusController) pruneSeen(
 	}
 }
 
-func (c *InstanceStatusController) Register(_ context.Context, m manager.Manager) error {
+func (c *Controller) Register(_ context.Context, m manager.Manager) error {
 	return controllerruntime.NewControllerManagedBy(m).
-		Named("interruption.instancestatus").
+		Named("instancestatus").
 		WatchesRawSource(singleton.Source()).
 		WithOptions(controller.Options{
-			RateLimiter: instanceStatusRateLimiter(),
+			RateLimiter: rateLimiter(),
 		}).
 		Complete(singleton.AsReconciler(c))
 }
 
-func instanceStatusRateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
-	return workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](InstanceStatusInterval, InstanceStatusInterval)
+func rateLimiter() workqueue.TypedRateLimiter[reconcile.Request] {
+	return workqueue.NewTypedItemExponentialFailureRateLimiter[reconcile.Request](reconcileInterval, reconcileInterval)
 }

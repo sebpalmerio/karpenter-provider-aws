@@ -32,6 +32,7 @@ import (
 	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
 	crcapacitytype "github.com/aws/karpenter-provider-aws/pkg/controllers/capacityreservation/capacitytype"
 	crexpiration "github.com/aws/karpenter-provider-aws/pkg/controllers/capacityreservation/expiration"
+	instancestatuscontroller "github.com/aws/karpenter-provider-aws/pkg/controllers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/metrics"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/nodeclass"
 	nodeclasshash "github.com/aws/karpenter-provider-aws/pkg/controllers/nodeclass/hash"
@@ -114,7 +115,8 @@ func NewControllers(
 		crexpiration.NewController(clk, kubeClient, cloudProvider, capacityReservationProvider),
 		metrics.NewController(kubeClient, cloudProvider),
 		arczonalshiftcontroller.NewController(kubeClient, recorder, zonalshiftProvider),
-		interruption.NewInstanceStatusController(kubeClient, clk, recorder, instanceStatusProvider),
+		instancestatuscontroller.NewController(kubeClient, clk, instanceStatusProvider),
+		interruption.NewScheduledEventController(kubeClient, recorder, instanceStatusProvider),
 	}
 	// Instance profile garbage collection requires IAM API access. Skip registering the controller when running
 	// in isolated VPC mode to avoid initiating calls to public AWS endpoints that won’t be reachable.

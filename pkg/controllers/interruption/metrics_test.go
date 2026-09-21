@@ -20,21 +20,7 @@ import (
 	"github.com/awslabs/operatorpkg/metrics"
 
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages"
-	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 )
-
-func TestInstanceStatusMetricCategoryValues(t *testing.T) {
-	for _, category := range []instancestatus.Category{
-		instancestatus.InstanceStatus,
-		instancestatus.SystemStatus,
-		instancestatus.EventStatus,
-	} {
-		value := instanceStatusMetricCategoryName(category)
-		if !hasMetricValue(Category.Values, value) {
-			t.Fatalf("expected instance status category %q to be documented", value)
-		}
-	}
-}
 
 func TestInterruptionMetricValueSets(t *testing.T) {
 	eventStatus := string(messages.EventStatusKind)

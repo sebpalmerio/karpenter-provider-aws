@@ -22,13 +22,11 @@ import (
 	"sigs.k8s.io/karpenter/pkg/metrics"
 
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages"
-	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 )
 
 const (
 	interruptionSubsystem = "interruption"
 	messageTypeLabel      = "message_type"
-	categoryLabel         = "category"
 )
 
 var (
@@ -37,26 +35,9 @@ var (
 		Help:   "The type of interruption message received from the SQS queue. See https://karpenter.sh/docs/concepts/disruption/#interruption.",
 		Values: interruptionMessageKindValues,
 	}
-	Category = opmetrics.Label{
-		Name:   categoryLabel,
-		Help:   "The EC2 instance status check category that was detected as unhealthy. See https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-system-instance-status-check.html.",
-		Values: instanceStatusCategoryValues,
-	}
 )
 
 var (
-	instanceStatusCategoryValue = opmetrics.Value{
-		Name: string(instancestatus.InstanceStatus),
-		Help: "The EC2 instance reachability status check reported an impairment.",
-	}
-	systemStatusCategoryValue = opmetrics.Value{
-		Name: string(instancestatus.SystemStatus),
-		Help: "The EC2 system reachability status check reported an impairment.",
-	}
-	eventStatusCategoryValue = opmetrics.Value{
-		Name: string(instancestatus.EventStatus),
-		Help: "EC2 reported a scheduled maintenance event for the instance.",
-	}
 	spotInterruptionKindValue = opmetrics.Value{
 		Name: string(messages.SpotInterruptionKind),
 		Help: "EC2 issued a two-minute Spot interruption notice for the instance.",
@@ -87,12 +68,6 @@ var (
 	}
 )
 
-var instanceStatusCategoryValues = []opmetrics.Value{
-	instanceStatusCategoryValue,
-	systemStatusCategoryValue,
-	eventStatusCategoryValue,
-}
-
 // interruptionMessageKindValues contains only msg.Kind() values emitted by the SQS controller.
 var interruptionMessageKindValues = []opmetrics.Value{
 	spotInterruptionKindValue,
@@ -112,19 +87,6 @@ var interruptionDisruptionReasonValues = []opmetrics.Value{
 	instanceTerminatedKindValue,
 	capacityReservationInterruptionKindValue,
 	eventStatusKindValue,
-}
-
-func instanceStatusMetricCategoryName(category instancestatus.Category) string {
-	switch category {
-	case instancestatus.InstanceStatus:
-		return instanceStatusCategoryValue.Name
-	case instancestatus.SystemStatus:
-		return systemStatusCategoryValue.Name
-	case instancestatus.EventStatus:
-		return eventStatusCategoryValue.Name
-	default:
-		return string(category)
-	}
 }
 
 var (
@@ -160,17 +122,6 @@ var (
 			Buckets:   metrics.DurationBuckets(),
 		},
 		[]opmetrics.Label{},
-		opmetrics.GA,
-	)
-	InstanceStatusUnhealthy = opmetrics.NewPrometheusCounter(
-		crmetrics.Registry,
-		prometheus.CounterOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: interruptionSubsystem,
-			Name:      "instance_status_unhealthy_total",
-			Help:      "Count of unhealthy EC2 instance status occurrences detected during this controller process. Broken down by status check category.",
-		},
-		[]opmetrics.Label{Category},
 		opmetrics.GA,
 	)
 )
