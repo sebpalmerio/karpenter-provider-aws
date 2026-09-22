@@ -17,9 +17,7 @@ package interruption_test
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -85,18 +83,6 @@ var controller *interruption.Controller
 var eventStatusController *interruption.ScheduledEventController
 var instanceStatusController *statuscontroller.Controller
 
-type nodeClaimListFailureClient struct {
-	client.Client
-	failNext atomic.Bool
-}
-
-func (c *nodeClaimListFailureClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
-	if _, ok := list.(*karpv1.NodeClaimList); ok && c.failNext.CompareAndSwap(true, false) {
-		return errors.New("injected NodeClaim list failure")
-	}
-	return c.Client.List(ctx, list, opts...)
-}
-
 func TestAPIs(t *testing.T) {
 	ctx = TestContextWithLogger(t)
 	RegisterFailHandler(Fail)
@@ -127,7 +113,6 @@ var _ = BeforeEach(func() {
 	sqsapi.Reset()
 	awsEnv.EC2API.DescribeInstanceStatusBehavior.Reset()
 	awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{})
-	instancestatus.UnhealthyTotal.Reset()
 })
 
 var _ = AfterEach(func() {
@@ -367,9 +352,6 @@ var _ = Describe("InterruptionHandling", func() {
 			awsEnv.Clock.Step(time.Hour)
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
-				"category": "SystemStatus",
-			})
 			ExpectExists(ctx, env.Client, nodeClaim)
 			node = ExpectExists(ctx, env.Client, node)
 			ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
@@ -396,9 +378,6 @@ var _ = Describe("InterruptionHandling", func() {
 			awsEnv.Clock.Step(time.Hour)
 			ExpectApplied(ctx, env.Client, nodeClaim, node)
 			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
-				"category": "InstanceStatus",
-			})
 			ExpectExists(ctx, env.Client, nodeClaim)
 			node = ExpectExists(ctx, env.Client, node)
 			ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
@@ -537,233 +516,7 @@ var _ = Describe("InterruptionHandling", func() {
 				metrics.ReasonLabel: "event_status",
 				"nodepool":          "default",
 			})
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
-				"category": "EventStatus",
-			})
 			ExpectNotFound(ctx, env.Client, nodeClaim)
-		})
-		It("should publish reachability health and emit the metric without deleting the NodeClaim", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{InterruptionQueue: lo.ToPtr("")}))
-			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
-				InstanceStatuses: []ec2types.InstanceStatus{
-					{
-						InstanceId: lo.ToPtr(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))),
-						InstanceStatus: &ec2types.InstanceStatusSummary{
-							Status: ec2types.SummaryStatusImpaired,
-							Details: []ec2types.InstanceStatusDetails{
-								{
-									Status:        ec2types.StatusTypeFailed,
-									Name:          ec2types.StatusNameReachability,
-									ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
-								},
-							},
-						},
-					},
-				},
-			})
-			awsEnv.Clock.Step(time.Hour)
-			ExpectApplied(ctx, env.Client, nodeClaim, node)
-			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
-				"category": "InstanceStatus",
-			})
-			ExpectExists(ctx, env.Client, nodeClaim)
-		})
-		It("should only emit the metric once across multiple reconciles for the same unhealthy instance", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{InterruptionQueue: lo.ToPtr("")}))
-			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
-				InstanceStatuses: []ec2types.InstanceStatus{
-					{
-						InstanceId: lo.ToPtr(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))),
-						InstanceStatus: &ec2types.InstanceStatusSummary{
-							Status: ec2types.SummaryStatusImpaired,
-							Details: []ec2types.InstanceStatusDetails{
-								{
-									Status:        ec2types.StatusTypeFailed,
-									Name:          ec2types.StatusNameReachability,
-									ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
-								},
-							},
-						},
-					},
-				},
-			})
-			awsEnv.Clock.Step(time.Hour)
-			ExpectApplied(ctx, env.Client, nodeClaim, node)
-
-			failingClient := &nodeClaimListFailureClient{Client: env.Client}
-			retryingController := statuscontroller.NewController(
-				failingClient,
-				fakeClock,
-				awsEnv.InstanceStatusProvider,
-			)
-
-			ExpectSingletonReconciled(ctx, retryingController)
-			failingClient.failNext.Store(true)
-			_ = ExpectSingletonReconcileFailed(ctx, retryingController)
-			ExpectSingletonReconciled(ctx, retryingController)
-
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
-				"category": "InstanceStatus",
-			})
-		})
-		It("should emit the metric for each unique unhealthy instance", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{InterruptionQueue: lo.ToPtr("")}))
-
-			// Create a second nodeclaim/node pair
-			nodeClaim2, node2 := coretest.NodeClaimAndNode(karpv1.NodeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						karpv1.NodePoolLabelKey: "default",
-					},
-				},
-				Status: karpv1.NodeClaimStatus{
-					ProviderID: fake.RandomProviderID(),
-				},
-			})
-			nodeClaim2.StatusConditions().SetTrue(karpv1.ConditionTypeRegistered)
-
-			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
-				InstanceStatuses: []ec2types.InstanceStatus{
-					{
-						InstanceId: lo.ToPtr(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))),
-						InstanceStatus: &ec2types.InstanceStatusSummary{
-							Status: ec2types.SummaryStatusImpaired,
-							Details: []ec2types.InstanceStatusDetails{
-								{
-									Status:        ec2types.StatusTypeFailed,
-									Name:          ec2types.StatusNameReachability,
-									ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
-								},
-							},
-						},
-					},
-					{
-						InstanceId: lo.ToPtr(lo.Must(utils.ParseInstanceID(nodeClaim2.Status.ProviderID))),
-						InstanceStatus: &ec2types.InstanceStatusSummary{
-							Status: ec2types.SummaryStatusImpaired,
-							Details: []ec2types.InstanceStatusDetails{
-								{
-									Status:        ec2types.StatusTypeFailed,
-									Name:          ec2types.StatusNameReachability,
-									ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
-								},
-							},
-						},
-					},
-				},
-			})
-			awsEnv.Clock.Step(time.Hour)
-			ExpectApplied(ctx, env.Client, nodeClaim, node, nodeClaim2, node2)
-
-			// First reconcile should count both instances
-			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 2, map[string]string{
-				"category": "InstanceStatus",
-			})
-
-			// Second reconcile should not increment further
-			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 2, map[string]string{
-				"category": "InstanceStatus",
-			})
-		})
-		It("should re-emit the metric when an instance recovers and becomes unhealthy again", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{InterruptionQueue: lo.ToPtr("")}))
-
-			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
-				InstanceStatuses: []ec2types.InstanceStatus{
-					{
-						InstanceId: lo.ToPtr(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))),
-						InstanceStatus: &ec2types.InstanceStatusSummary{
-							Status: ec2types.SummaryStatusImpaired,
-							Details: []ec2types.InstanceStatusDetails{
-								{
-									Status:        ec2types.StatusTypeFailed,
-									Name:          ec2types.StatusNameReachability,
-									ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
-								},
-							},
-						},
-					},
-				},
-			})
-			awsEnv.Clock.Step(time.Hour)
-			ExpectApplied(ctx, env.Client, nodeClaim, node)
-
-			// First reconcile detects the unhealthy instance
-			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
-				"category": "InstanceStatus",
-			})
-
-			// Instance recovers (no longer in DescribeInstanceStatus response)
-			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
-				InstanceStatuses: []ec2types.InstanceStatus{},
-			})
-			ExpectSingletonReconciled(ctx, instanceStatusController)
-
-			// Instance becomes unhealthy again
-			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
-				InstanceStatuses: []ec2types.InstanceStatus{
-					{
-						InstanceId: lo.ToPtr(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))),
-						InstanceStatus: &ec2types.InstanceStatusSummary{
-							Status: ec2types.SummaryStatusImpaired,
-							Details: []ec2types.InstanceStatusDetails{
-								{
-									Status:        ec2types.StatusTypeFailed,
-									Name:          ec2types.StatusNameReachability,
-									ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
-								},
-							},
-						},
-					},
-				},
-			})
-			awsEnv.Clock.Step(time.Hour)
-			ExpectSingletonReconciled(ctx, instanceStatusController)
-
-			// Metric should now be 2 (counted once for each occurrence)
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 2, map[string]string{
-				"category": "InstanceStatus",
-			})
-		})
-		It("should count a still-active occurrence again after the controller process restarts", func() {
-			ctx = options.ToContext(ctx, test.Options(test.OptionsFields{InterruptionQueue: lo.ToPtr("")}))
-			awsEnv.EC2API.DescribeInstanceStatusOutput.Set(&ec2.DescribeInstanceStatusOutput{
-				InstanceStatuses: []ec2types.InstanceStatus{
-					{
-						InstanceId: lo.ToPtr(lo.Must(utils.ParseInstanceID(nodeClaim.Status.ProviderID))),
-						InstanceStatus: &ec2types.InstanceStatusSummary{
-							Status: ec2types.SummaryStatusImpaired,
-							Details: []ec2types.InstanceStatusDetails{
-								{
-									Status:        ec2types.StatusTypeFailed,
-									Name:          ec2types.StatusNameReachability,
-									ImpairedSince: lo.ToPtr(awsEnv.Clock.Now()),
-								},
-							},
-						},
-					},
-				},
-			})
-			ExpectApplied(ctx, env.Client, nodeClaim, node)
-
-			ExpectSingletonReconciled(ctx, instanceStatusController)
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
-				"category": "InstanceStatus",
-			})
-
-			restartedController := statuscontroller.NewController(
-				env.Client,
-				fakeClock,
-				awsEnv.InstanceStatusProvider,
-			)
-			ExpectSingletonReconciled(ctx, restartedController)
-			ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 2, map[string]string{
-				"category": "InstanceStatus",
-			})
 		})
 	})
 })

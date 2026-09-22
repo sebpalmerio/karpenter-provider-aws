@@ -17,7 +17,6 @@ package interruption
 import (
 	"context"
 	"errors"
-	"sync/atomic"
 	"testing"
 
 	"github.com/aws/smithy-go"
@@ -81,23 +80,15 @@ func TestScheduledEventReturnsUnauthorizedScanError(t *testing.T) {
 	}
 }
 
-func TestScheduledEventPrunesUnrelatedDedupeAfterOneHandlerFails(t *testing.T) {
-	failedInstanceID := "i-failed"
-	recoveredInstanceID := "i-recovered"
-	expectedErr := errors.New("injected scheduled-event lookup failure")
-	var eventLookupAttempted atomic.Bool
+func TestScheduledEventReturnsHandlerError(t *testing.T) {
+	instanceID := "i-0123456789"
+	expectedErr := errors.New("injected NodeClaim list failure")
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
 		WithInterceptorFuncs(interceptor.Funcs{
 			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 				if _, ok := list.(*karpv1.NodeClaimList); ok {
-					listOptions := &client.ListOptions{}
-					listOptions.ApplyOptions(opts)
-					if listOptions.FieldSelector != nil &&
-						listOptions.FieldSelector.String() == "status.instanceID="+failedInstanceID {
-						eventLookupAttempted.Store(true)
-						return expectedErr
-					}
+					return expectedErr
 				}
 				return c.List(ctx, list, opts...)
 			},
@@ -109,25 +100,12 @@ func TestScheduledEventPrunesUnrelatedDedupeAfterOneHandlerFails(t *testing.T) {
 		eventStatusProvider{
 			errors: map[instancestatus.Category]error{},
 			statuses: map[instancestatus.Category][]instancestatus.HealthStatus{
-				instancestatus.EventStatus: {{InstanceID: failedInstanceID}},
+				instancestatus.EventStatus: {{InstanceID: instanceID}},
 			},
 		},
 	)
-	failedKey := unhealthyKey{instanceID: failedInstanceID}
-	recoveredKey := unhealthyKey{instanceID: recoveredInstanceID}
-	controller.seen[failedKey] = struct{}{}
-	controller.seen[recoveredKey] = struct{}{}
 
 	if _, err := controller.Reconcile(context.Background()); !errors.Is(err, expectedErr) {
-		t.Fatalf("expected scheduled-event handling failure, got %v", err)
-	}
-	if !eventLookupAttempted.Load() {
-		t.Fatal("expected scheduled-event NodeClaim lookup")
-	}
-	if _, ok := controller.seen[failedKey]; !ok {
-		t.Fatal("expected failed event key to retain dedupe state")
-	}
-	if _, ok := controller.seen[recoveredKey]; ok {
-		t.Fatal("expected unrelated recovered event key to be pruned")
+		t.Fatalf("expected injected NodeClaim list failure, got %v", err)
 	}
 }

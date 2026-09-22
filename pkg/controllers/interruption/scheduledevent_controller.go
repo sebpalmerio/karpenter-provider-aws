@@ -17,7 +17,6 @@ package interruption
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/awslabs/operatorpkg/reconciler"
@@ -27,7 +26,6 @@ import (
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/karpenter/pkg/events"
@@ -40,16 +38,10 @@ import (
 
 const scheduledEventInterval = time.Minute
 
-type unhealthyKey struct {
-	instanceID string
-}
-
 // ScheduledEventController polls EC2 scheduled events and routes them through interruption handling.
 type ScheduledEventController struct {
 	InterruptionHandler
 	provider instancestatus.Provider
-	seen     map[unhealthyKey]struct{}
-	mu       sync.Mutex
 }
 
 func NewScheduledEventController(
@@ -63,7 +55,6 @@ func NewScheduledEventController(
 			recorder:   recorder,
 		},
 		provider: provider,
-		seen:     make(map[unhealthyKey]struct{}),
 	}
 }
 
@@ -78,62 +69,19 @@ func (c *ScheduledEventController) Reconcile(ctx context.Context) (reconciler.Re
 		return reconciler.Result{}, fmt.Errorf("getting EC2 %s checks, %w", instancestatus.EventStatus, err)
 	}
 
-	currentKeys := make(map[unhealthyKey]struct{})
 	errs := make([]error, len(statuses))
-	failedKeys := make([]unhealthyKey, len(statuses))
 	workqueue.ParallelizeUntil(ctx, 10, len(statuses), func(i int) {
 		status := statuses[i]
-		found, handleErr := c.handleMessage(ctx, instancestatusmsg.New(status.InstanceID, status.ImpairedSince), false)
-		if found {
-			c.recordUnhealthyInstance(ctx, status.InstanceID, currentKeys)
-		}
+		handleErr := c.handleMessage(ctx, instancestatusmsg.New(status.InstanceID, status.ImpairedSince))
 		if handleErr != nil {
 			errs[i] = fmt.Errorf("handling scheduled event message, %w", handleErr)
-			failedKeys[i] = unhealthyKey{instanceID: status.InstanceID}
 		}
 	})
-	protected := make(map[unhealthyKey]struct{})
-	for i, err := range errs {
-		if err != nil {
-			protected[failedKeys[i]] = struct{}{}
-		}
-	}
-	c.pruneSeen(currentKeys, protected)
 
 	if err := multierr.Combine(errs...); err != nil {
 		return reconciler.Result{}, err
 	}
 	return reconciler.Result{RequeueAfter: scheduledEventInterval}, nil
-}
-
-func (c *ScheduledEventController) recordUnhealthyInstance(ctx context.Context, instanceID string, currentKeys map[unhealthyKey]struct{}) {
-	key := unhealthyKey{instanceID: instanceID}
-	c.mu.Lock()
-	currentKeys[key] = struct{}{}
-	_, already := c.seen[key]
-	if !already {
-		c.seen[key] = struct{}{}
-	}
-	c.mu.Unlock()
-	if !already {
-		log.FromContext(ctx).Info("detected unhealthy instance owned by cluster",
-			"instanceID", instanceID,
-			"category", string(instancestatus.EventStatus))
-		instancestatus.UnhealthyTotal.Inc(map[string]string{instancestatus.CategoryLabel.Name: string(instancestatus.EventStatus)})
-	}
-}
-
-func (c *ScheduledEventController) pruneSeen(currentKeys, protected map[unhealthyKey]struct{}) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for key := range c.seen {
-		if _, ok := protected[key]; ok {
-			continue
-		}
-		if _, ok := currentKeys[key]; !ok {
-			delete(c.seen, key)
-		}
-	}
 }
 
 func (c *ScheduledEventController) Register(_ context.Context, m manager.Manager) error {

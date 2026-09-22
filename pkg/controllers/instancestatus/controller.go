@@ -17,7 +17,6 @@ package instancestatus
 import (
 	"context"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/awslabs/operatorpkg/reconciler"
@@ -31,7 +30,6 @@ import (
 	controllerruntime "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -45,20 +43,9 @@ import (
 
 const reconcileInterval = time.Minute
 
-type unhealthyKey struct {
-	instanceID string
-	category   instancestatusprovider.Category
-}
-
 type assessmentResult struct {
-	category instancestatusprovider.Category
 	statuses map[string]instancestatusprovider.HealthStatus
 	err      error
-}
-
-type scanResult struct {
-	assessment assessmentResult
-	err        error
 }
 
 type registeredNode struct {
@@ -71,8 +58,6 @@ type Controller struct {
 	kubeClient client.Client
 	provider   instancestatusprovider.Provider
 	clock      clock.Clock
-	seen       map[unhealthyKey]struct{}
-	mu         sync.Mutex
 }
 
 func NewController(kubeClient client.Client, clk clock.Clock, provider instancestatusprovider.Provider) *Controller {
@@ -80,40 +65,27 @@ func NewController(kubeClient client.Client, clk clock.Clock, provider instances
 		kubeClient: kubeClient,
 		provider:   provider,
 		clock:      clk,
-		seen:       make(map[unhealthyKey]struct{}),
 	}
 }
 
 func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	ctx = injection.WithControllerName(ctx, "instancestatus")
 
-	instanceAssessment, instanceErr, systemAssessment, systemErr := c.scanHealth(ctx)
+	instanceAssessment, systemAssessment, scanErr := c.scanHealth(ctx)
 	observationTime := c.clock.Now()
-	currentKeys := make(map[unhealthyKey]struct{})
 
-	canPrune, err := c.publishConditions(ctx, instanceAssessment, systemAssessment, observationTime, currentKeys)
-	if canPrune {
-		processed := make(map[instancestatusprovider.Category]struct{}, 2)
-		for _, assessment := range []assessmentResult{instanceAssessment, systemAssessment} {
-			if assessment.err == nil {
-				processed[assessment.category] = struct{}{}
-			}
-		}
-		c.pruneSeen(currentKeys, processed)
-	}
-
-	if errs := multierr.Combine(err, instanceErr, systemErr); errs != nil {
+	err := c.publishConditions(ctx, instanceAssessment, systemAssessment, observationTime)
+	if errs := multierr.Combine(err, scanErr); errs != nil {
 		return reconciler.Result{}, errs
 	}
 	return reconciler.Result{RequeueAfter: reconcileInterval}, nil
 }
 
-func (c *Controller) scanHealth(ctx context.Context) (assessmentResult, error, assessmentResult, error) {
-	scan := func(category instancestatusprovider.Category) <-chan scanResult {
-		results := make(chan scanResult, 1)
+func (c *Controller) scanHealth(ctx context.Context) (assessmentResult, assessmentResult, error) {
+	scan := func(category instancestatusprovider.Category) <-chan assessmentResult {
+		results := make(chan assessmentResult, 1)
 		go func() {
-			assessment, err := c.scan(ctx, category)
-			results <- scanResult{assessment: assessment, err: err}
+			results <- c.scan(ctx, category)
 		}()
 		return results
 	}
@@ -122,26 +94,26 @@ func (c *Controller) scanHealth(ctx context.Context) (assessmentResult, error, a
 	systemResult := scan(instancestatusprovider.SystemStatus)
 	instanceAssessment := <-instanceResult
 	systemAssessment := <-systemResult
-	return instanceAssessment.assessment, instanceAssessment.err, systemAssessment.assessment, systemAssessment.err
+	return instanceAssessment, systemAssessment, multierr.Combine(instanceAssessment.err, systemAssessment.err)
 }
 
-func (c *Controller) scan(ctx context.Context, category instancestatusprovider.Category) (assessmentResult, error) {
+func (c *Controller) scan(ctx context.Context, category instancestatusprovider.Category) assessmentResult {
 	statuses, err := c.provider.List(ctx, category)
 	result := assessmentResult{
-		category: category,
 		statuses: map[string]instancestatusprovider.HealthStatus{},
-		err:      err,
 	}
 	if err != nil {
 		if awserrors.IsUnauthorizedOperationError(err) {
-			return result, fmt.Errorf("ec2:DescribeInstanceStatus permission is not allowed for %s checks; grant the permission and Karpenter will retry automatically, %w", category, err)
+			result.err = fmt.Errorf("ec2:DescribeInstanceStatus permission is not allowed for %s checks; grant the permission and Karpenter will retry automatically, %w", category, err)
+			return result
 		}
-		return result, fmt.Errorf("getting EC2 %s checks, %w", category, err)
+		result.err = fmt.Errorf("getting EC2 %s checks, %w", category, err)
+		return result
 	}
 	for _, status := range statuses {
 		result.statuses[status.InstanceID] = status
 	}
-	return result, nil
+	return result
 }
 
 func (c *Controller) publishConditions(
@@ -149,28 +121,27 @@ func (c *Controller) publishConditions(
 	instanceAssessment assessmentResult,
 	systemAssessment assessmentResult,
 	observationTime time.Time,
-	currentKeys map[unhealthyKey]struct{},
-) (bool, error) {
+) error {
 	instanceComplete := instanceAssessment.err == nil
 	systemComplete := systemAssessment.err == nil
 	if !instanceComplete && !systemComplete {
-		return true, nil
+		return nil
 	}
 	if (!instanceComplete && len(systemAssessment.statuses) == 0) ||
 		(!systemComplete && len(instanceAssessment.statuses) == 0) {
-		return true, nil
+		return nil
 	}
 
 	nodes, err := c.registeredNodes(ctx)
 	if err != nil {
-		return false, fmt.Errorf("listing registered managed Nodes, %w", err)
+		return fmt.Errorf("listing registered managed Nodes, %w", err)
 	}
 
 	errs := make([]error, len(nodes))
 	workqueue.ParallelizeUntil(ctx, 10, len(nodes), func(i int) {
-		errs[i] = c.publishCondition(ctx, nodes[i].node, nodes[i].instanceID, instanceAssessment, systemAssessment, observationTime, currentKeys)
+		errs[i] = c.publishCondition(ctx, nodes[i].node, nodes[i].instanceID, instanceAssessment, systemAssessment, observationTime)
 	})
-	return true, multierr.Combine(errs...)
+	return multierr.Combine(errs...)
 }
 
 func (c *Controller) publishCondition(
@@ -180,16 +151,9 @@ func (c *Controller) publishCondition(
 	instanceAssessment assessmentResult,
 	systemAssessment assessmentResult,
 	observationTime time.Time,
-	currentKeys map[unhealthyKey]struct{},
 ) error {
 	instanceHealth, instanceImpaired := instanceAssessment.statuses[instanceID]
 	systemHealth, systemImpaired := systemAssessment.statuses[instanceID]
-	if instanceImpaired {
-		c.recordUnhealthyInstance(ctx, instanceID, instancestatusprovider.InstanceStatus, currentKeys)
-	}
-	if systemImpaired {
-		c.recordUnhealthyInstance(ctx, instanceID, instancestatusprovider.SystemStatus, currentKeys)
-	}
 
 	instanceComplete := instanceAssessment.err == nil
 	systemComplete := systemAssessment.err == nil
@@ -402,41 +366,6 @@ func (c *Controller) patchCondition(ctx context.Context, node *corev1.Node, cond
 		updated.Status.Conditions = append(updated.Status.Conditions, condition)
 	}
 	return client.IgnoreNotFound(c.kubeClient.Status().Patch(ctx, updated, client.StrategicMergeFrom(node)))
-}
-
-func (c *Controller) recordUnhealthyInstance(
-	ctx context.Context,
-	instanceID string,
-	category instancestatusprovider.Category,
-	currentKeys map[unhealthyKey]struct{},
-) {
-	key := unhealthyKey{instanceID: instanceID, category: category}
-	c.mu.Lock()
-	currentKeys[key] = struct{}{}
-	_, already := c.seen[key]
-	if !already {
-		c.seen[key] = struct{}{}
-	}
-	c.mu.Unlock()
-	if !already {
-		log.FromContext(ctx).Info("detected unhealthy instance owned by cluster",
-			"instanceID", instanceID,
-			"category", string(category))
-		instancestatusprovider.UnhealthyTotal.Inc(map[string]string{instancestatusprovider.CategoryLabel.Name: string(category)})
-	}
-}
-
-func (c *Controller) pruneSeen(currentKeys map[unhealthyKey]struct{}, processed map[instancestatusprovider.Category]struct{}) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for key := range c.seen {
-		if _, ok := processed[key.category]; !ok {
-			continue
-		}
-		if _, ok := currentKeys[key]; !ok {
-			delete(c.seen, key)
-		}
-	}
 }
 
 func (c *Controller) Register(_ context.Context, m manager.Manager) error {

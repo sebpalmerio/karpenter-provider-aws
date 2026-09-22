@@ -845,13 +845,6 @@ Amount of time an interruption message is on the queue before it is processed by
 - Type: [Histogram](https://prometheus.io/docs/concepts/metric_types/#histogram)
 - Stability Level: STABLE
 
-### `karpenter_interruption_instance_status_unhealthy_total`
-Count of unhealthy EC2 instance status occurrences detected during this controller process. Broken down by status check category.
-- Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
-- Stability Level: STABLE
-- Dimensions:
-  - `category` — The EC2 instance status check category that was detected as unhealthy. See https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-system-instance-status-check.html.
-
 ### `karpenter_interruption_deleted_messages_total`
 Count of messages deleted from the SQS queue.
 - Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)

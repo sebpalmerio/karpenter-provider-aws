@@ -42,7 +42,6 @@ import (
 type fakeProvider struct {
 	instanceID string
 	errors     map[instancestatusprovider.Category]error
-	impaired   *atomic.Bool
 	statuses   map[instancestatusprovider.Category][]instancestatusprovider.HealthStatus
 }
 
@@ -53,7 +52,7 @@ func (p fakeProvider) List(_ context.Context, category instancestatusprovider.Ca
 	if p.statuses != nil {
 		return append([]instancestatusprovider.HealthStatus{}, p.statuses[category]...), nil
 	}
-	if category == instancestatusprovider.InstanceStatus && p.instanceID != "" && (p.impaired == nil || p.impaired.Load()) {
+	if category == instancestatusprovider.InstanceStatus && p.instanceID != "" {
 		return []instancestatusprovider.HealthStatus{{
 			InstanceID:    p.instanceID,
 			ImpairedSince: time.Date(2026, time.September, 16, 12, 0, 0, 0, time.UTC),
@@ -129,18 +128,15 @@ func BenchmarkRegisteredNodesFor(b *testing.B) {
 	}
 }
 
-func TestDedupeStateSurvivesKubernetesReadFailure(t *testing.T) {
+func TestKubernetesReadErrorIsReturned(t *testing.T) {
 	instanceID := "i-0123456789"
-	nodeClaim, node := managedNode(instanceID)
-	var failNextNodeClaimList atomic.Bool
+	expectedErr := errors.New("injected NodeClaim list failure")
 	kubeClient := fake.NewClientBuilder().
 		WithScheme(scheme.Scheme).
-		WithStatusSubresource(&corev1.Node{}).
-		WithObjects(nodeClaim, node).
 		WithInterceptorFuncs(interceptor.Funcs{
 			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
-				if _, ok := list.(*karpv1.NodeClaimList); ok && failNextNodeClaimList.CompareAndSwap(true, false) {
-					return errors.New("injected NodeClaim list failure")
+				if _, ok := list.(*karpv1.NodeClaimList); ok {
+					return expectedErr
 				}
 				return c.List(ctx, list, opts...)
 			},
@@ -155,75 +151,8 @@ func TestDedupeStateSurvivesKubernetesReadFailure(t *testing.T) {
 		},
 	)
 
-	if _, err := controller.Reconcile(context.Background()); err != nil {
-		t.Fatalf("initial reconciliation failed, %v", err)
-	}
-	key := unhealthyKey{instanceID: instanceID, category: instancestatusprovider.InstanceStatus}
-	if _, ok := controller.seen[key]; !ok {
-		t.Fatal("expected initial impairment in dedupe state")
-	}
-
-	failNextNodeClaimList.Store(true)
-	if _, err := controller.Reconcile(context.Background()); err == nil {
-		t.Fatal("expected injected NodeClaim list failure")
-	}
-	if _, ok := controller.seen[key]; !ok {
-		t.Fatal("expected transient Kubernetes failure to preserve dedupe state")
-	}
-}
-
-func TestCompleteRecoveryPrunesDedupeAfterPatchFailure(t *testing.T) {
-	instanceID := "i-0123456789"
-	nodeClaim, node := managedNode(instanceID)
-	var impaired atomic.Bool
-	impaired.Store(true)
-	var failPatch atomic.Bool
-	expectedErr := errors.New("injected Node status patch failure")
-	kubeClient := fake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithStatusSubresource(&corev1.Node{}).
-		WithObjects(nodeClaim, node).
-		WithInterceptorFuncs(interceptor.Funcs{
-			SubResourcePatch: func(
-				ctx context.Context,
-				c client.Client,
-				subResourceName string,
-				obj client.Object,
-				patch client.Patch,
-				opts ...client.SubResourcePatchOption,
-			) error {
-				if failPatch.Load() {
-					return expectedErr
-				}
-				return c.SubResource(subResourceName).Patch(ctx, obj, patch, opts...)
-			},
-		}).
-		Build()
-	controller := NewController(
-		kubeClient,
-		clocktesting.NewFakeClock(time.Date(2026, time.September, 16, 12, 1, 0, 0, time.UTC)),
-		fakeProvider{
-			instanceID: instanceID,
-			errors:     map[instancestatusprovider.Category]error{},
-			impaired:   &impaired,
-		},
-	)
-
-	if _, err := controller.Reconcile(context.Background()); err != nil {
-		t.Fatalf("initial reconciliation failed, %v", err)
-	}
-	key := unhealthyKey{instanceID: instanceID, category: instancestatusprovider.InstanceStatus}
-	if _, ok := controller.seen[key]; !ok {
-		t.Fatal("expected initial impairment in dedupe state")
-	}
-
-	impaired.Store(false)
-	failPatch.Store(true)
 	if _, err := controller.Reconcile(context.Background()); !errors.Is(err, expectedErr) {
-		t.Fatalf("expected injected Node patch failure, got %v", err)
-	}
-	if _, ok := controller.seen[key]; ok {
-		t.Fatal("expected complete recovery observation to prune dedupe state")
+		t.Fatalf("expected injected NodeClaim list failure, got %v", err)
 	}
 }
 

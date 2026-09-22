@@ -21,15 +21,11 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/record"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/events"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	"github.com/aws/karpenter-provider-aws/pkg/apis"
 	statuscontroller "github.com/aws/karpenter-provider-aws/pkg/controllers/instancestatus"
-	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -40,17 +36,6 @@ import (
 type instanceStatusProvider struct {
 	statuses map[instancestatus.Category][]instancestatus.HealthStatus
 	errors   map[instancestatus.Category]error
-}
-
-type nodeClaimDeleteErrorClient struct {
-	client.Client
-}
-
-func (c *nodeClaimDeleteErrorClient) Delete(ctx context.Context, object client.Object, opts ...client.DeleteOption) error {
-	if _, ok := object.(*karpv1.NodeClaim); ok {
-		return errors.New("injected NodeClaim delete failure")
-	}
-	return c.Client.Delete(ctx, object, opts...)
 }
 
 func (p *instanceStatusProvider) List(_ context.Context, category instancestatus.Category) ([]instancestatus.HealthStatus, error) {
@@ -258,24 +243,6 @@ var _ = Describe("EC2 Status Conditions", func() {
 		ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
 	})
 
-	It("records a detected scheduled event when handling the NodeClaim fails", func() {
-		provider.statuses[instancestatus.EventStatus] = []instancestatus.HealthStatus{{
-			InstanceID:    instanceID,
-			ImpairedSince: fakeClock.Now(),
-		}}
-		eventController := interruption.NewScheduledEventController(
-			&nodeClaimDeleteErrorClient{Client: env.Client},
-			events.NewRecorder(&record.FakeRecorder{}),
-			provider,
-		)
-		ExpectApplied(ctx, env.Client, nodeClaim, node)
-
-		_ = ExpectSingletonReconcileFailed(ctx, eventController)
-
-		ExpectMetricCounterValue(instancestatus.UnhealthyTotal, 1, map[string]string{
-			"category": "EventStatus",
-		})
-	})
 })
 
 func hasEC2StatusCondition(node *corev1.Node) bool {
