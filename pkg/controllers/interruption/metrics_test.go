@@ -23,12 +23,18 @@ import (
 )
 
 func TestInterruptionMetricValueSets(t *testing.T) {
-	eventStatus := string(messages.EventStatusKind)
-	if hasMetricValue(interruptionMessageKindValues, eventStatus) {
-		t.Fatalf("expected %q to be excluded from SQS message types", eventStatus)
-	}
-	if !hasMetricValue(interruptionDisruptionReasonValues, eventStatus) {
-		t.Fatalf("expected %q to remain a NodeClaim disruption reason", eventStatus)
+	for _, kind := range []messages.Kind{
+		messages.InstanceStatusKind,
+		messages.SystemStatusKind,
+		messages.EventStatusKind,
+	} {
+		name := string(kind)
+		if hasMetricValue(interruptionMessageKindValues, name) {
+			t.Fatalf("expected %q to be excluded from SQS message types", name)
+		}
+		if !hasMetricValue(interruptionDisruptionReasonValues, name) {
+			t.Fatalf("expected %q to remain a NodeClaim disruption reason", name)
+		}
 	}
 }
 

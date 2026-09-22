@@ -31,6 +31,7 @@ import (
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
 
+	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages"
 	instancestatusmsg "github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages/instancestatus"
 	awserrors "github.com/aws/karpenter-provider-aws/pkg/errors"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
@@ -72,7 +73,7 @@ func (c *ScheduledEventController) Reconcile(ctx context.Context) (reconciler.Re
 	errs := make([]error, len(statuses))
 	workqueue.ParallelizeUntil(ctx, 10, len(statuses), func(i int) {
 		status := statuses[i]
-		handleErr := c.handleMessage(ctx, instancestatusmsg.New(status.InstanceID, status.ImpairedSince))
+		handleErr := c.handleMessage(ctx, instancestatusmsg.New(status.InstanceID, messages.EventStatusKind, status.ImpairedSince))
 		if handleErr != nil {
 			errs[i] = fmt.Errorf("handling scheduled event message, %w", handleErr)
 		}

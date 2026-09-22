@@ -66,6 +66,14 @@ var (
 		Name: string(messages.EventStatusKind),
 		Help: "An EC2 scheduled-event status check fired for the instance.",
 	}
+	instanceStatusKindValue = opmetrics.Value{
+		Name: string(messages.InstanceStatusKind),
+		Help: "An EC2 instance reachability status check remained impaired while Node Repair was disabled.",
+	}
+	systemStatusKindValue = opmetrics.Value{
+		Name: string(messages.SystemStatusKind),
+		Help: "An EC2 system reachability status check remained impaired while Node Repair was disabled.",
+	}
 )
 
 // interruptionMessageKindValues contains only msg.Kind() values emitted by the SQS controller.
@@ -86,6 +94,8 @@ var interruptionDisruptionReasonValues = []opmetrics.Value{
 	instanceStoppedKindValue,
 	instanceTerminatedKindValue,
 	capacityReservationInterruptionKindValue,
+	instanceStatusKindValue,
+	systemStatusKindValue,
 	eventStatusKindValue,
 }
 

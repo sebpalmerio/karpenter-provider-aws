@@ -22,6 +22,7 @@ import (
 	"github.com/patrickmn/go-cache"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 
 	arczonalshiftcontroller "github.com/aws/karpenter-provider-aws/pkg/controllers/arczonalshift"
 
@@ -100,6 +101,10 @@ func NewControllers(
 	caBundle *string,
 	celEnv *kubeletcel.CELEnvironment,
 ) []controller.Controller {
+	legacyStatusInterruptionHandler := interruption.NewLegacyStatusInterruptionHandler(kubeClient, clk, recorder)
+	if coreoptions.FromContext(ctx).FeatureGates.NodeRepair {
+		legacyStatusInterruptionHandler = nil
+	}
 	controllers := []controller.Controller{
 		nodeclasshash.NewController(kubeClient, caBundle),
 		nodeclass.NewController(clk, kubeClient, cloudProvider, recorder, cfg.Region, subnetProvider, securityGroupProvider, amiProvider, instanceProfileProvider, instanceTypeProvider, launchTemplateProvider, capacityReservationProvider, placementGroupProvider, ec2api, validationCache, recreationCache, amiResolver, celEnv, options.FromContext(ctx).DisableDryRun),
@@ -115,7 +120,12 @@ func NewControllers(
 		crexpiration.NewController(clk, kubeClient, cloudProvider, capacityReservationProvider),
 		metrics.NewController(kubeClient, cloudProvider),
 		arczonalshiftcontroller.NewController(kubeClient, recorder, zonalshiftProvider),
-		instancestatuscontroller.NewController(kubeClient, clk, instanceStatusProvider),
+		instancestatuscontroller.NewController(
+			kubeClient,
+			clk,
+			instanceStatusProvider,
+			legacyStatusInterruptionHandler,
+		),
 		interruption.NewScheduledEventController(kubeClient, recorder, instanceStatusProvider),
 	}
 	// Instance profile garbage collection requires IAM API access. Skip registering the controller when running

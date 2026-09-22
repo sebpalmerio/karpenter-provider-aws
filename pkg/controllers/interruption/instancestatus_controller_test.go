@@ -21,11 +21,14 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/record"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
+	"sigs.k8s.io/karpenter/pkg/events"
 	coretest "sigs.k8s.io/karpenter/pkg/test"
 
 	"github.com/aws/karpenter-provider-aws/pkg/apis"
 	statuscontroller "github.com/aws/karpenter-provider-aws/pkg/controllers/instancestatus"
+	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -62,6 +65,7 @@ var _ = Describe("EC2 Status Conditions", func() {
 			env.Client,
 			fakeClock,
 			provider,
+			nil,
 		)
 		nodeClaim, node = coretest.NodeClaimAndNode(karpv1.NodeClaim{
 			Spec: karpv1.NodeClaimSpec{NodeClassRef: &karpv1.NodeClassReference{
@@ -97,8 +101,9 @@ var _ = Describe("EC2 Status Conditions", func() {
 		node = ExpectExists(ctx, env.Client, node)
 		condition := ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
 		Expect(condition.LastTransitionTime.Time.Equal(instanceImpairedSince)).To(BeTrue())
-		Expect(condition.Message).To(ContainSubstring("instance and system"))
+		Expect(condition.Message).To(Equal("EC2 reports a reachability impairment."))
 		Expect(node.Status.Conditions).To(ContainElement(HaveField("Type", corev1.NodeReady)))
+		ExpectExists(ctx, env.Client, nodeClaim)
 	})
 
 	It("preserves the transition clock when the contributing assessment changes", func() {
@@ -121,8 +126,7 @@ var _ = Describe("EC2 Status Conditions", func() {
 		node = ExpectExists(ctx, env.Client, node)
 		condition := ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
 		Expect(condition.LastTransitionTime.Time.Equal(impairedSince)).To(BeTrue())
-		Expect(condition.Message).To(ContainSubstring("system reachability"))
-		Expect(condition.Message).ToNot(ContainSubstring("instance and system"))
+		Expect(condition.Message).To(Equal("EC2 reports a reachability impairment."))
 	})
 
 	It("uses observation time when both complete scans report no impairment", func() {
@@ -198,7 +202,7 @@ var _ = Describe("EC2 Status Conditions", func() {
 		node = ExpectExists(ctx, env.Client, node)
 		condition := ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
 		Expect(condition.LastTransitionTime.Time.Equal(impairedSince)).To(BeTrue())
-		Expect(condition.Message).To(ContainSubstring("system status assessment did not complete"))
+		Expect(condition.Message).To(Equal("EC2 reports a reachability impairment."))
 	})
 
 	It("does not publish before the NodeClaim is registered", func() {
@@ -230,7 +234,7 @@ var _ = Describe("EC2 Status Conditions", func() {
 		Expect(hasEC2StatusCondition(node)).To(BeFalse())
 	})
 
-	It("publishes health independently of the NodeRepair feature gate", func() {
+	It("publishes health when NodeRepair is enabled", func() {
 		provider.statuses[instancestatus.InstanceStatus] = []instancestatus.HealthStatus{{
 			InstanceID:    instanceID,
 			ImpairedSince: fakeClock.Now(),
@@ -241,6 +245,74 @@ var _ = Describe("EC2 Status Conditions", func() {
 
 		node = ExpectExists(ctx, env.Client, node)
 		ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
+	})
+
+	It("preserves legacy interruption after the impairment threshold when NodeRepair is disabled", func() {
+		provider.statuses[instancestatus.InstanceStatus] = []instancestatus.HealthStatus{{
+			InstanceID:    instanceID,
+			ImpairedSince: fakeClock.Now().Add(-instancestatus.ImpairmentTolerationDuration),
+		}}
+		nodeClaim.Finalizers = []string{"testing/finalizer"}
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+
+		legacyController := statuscontroller.NewController(
+			env.Client,
+			fakeClock,
+			provider,
+			interruption.NewLegacyStatusInterruptionHandler(env.Client, fakeClock, events.NewRecorder(&record.FakeRecorder{})),
+		)
+		ExpectSingletonReconciled(ctx, legacyController)
+
+		nodeClaim = ExpectExists(ctx, env.Client, nodeClaim)
+		Expect(nodeClaim.DeletionTimestamp.IsZero()).To(BeFalse())
+		Expect(nodeClaim.Annotations).To(HaveKeyWithValue(
+			karpv1.NodeClaimTerminationTimestampAnnotationKey,
+			fakeClock.Now().Format(time.RFC3339),
+		))
+		node = ExpectExists(ctx, env.Client, node)
+		ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
+	})
+
+	It("does not use legacy interruption before the impairment threshold", func() {
+		provider.statuses[instancestatus.SystemStatus] = []instancestatus.HealthStatus{{
+			InstanceID:    instanceID,
+			ImpairedSince: fakeClock.Now().Add(-instancestatus.ImpairmentTolerationDuration + time.Second),
+		}}
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+
+		legacyController := statuscontroller.NewController(
+			env.Client,
+			fakeClock,
+			provider,
+			interruption.NewLegacyStatusInterruptionHandler(env.Client, fakeClock, events.NewRecorder(&record.FakeRecorder{})),
+		)
+		ExpectSingletonReconciled(ctx, legacyController)
+
+		ExpectExists(ctx, env.Client, nodeClaim)
+		node = ExpectExists(ctx, env.Client, node)
+		ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
+	})
+
+	It("uses legacy interruption for positive evidence when the other assessment fails", func() {
+		provider.statuses[instancestatus.InstanceStatus] = []instancestatus.HealthStatus{{
+			InstanceID:    instanceID,
+			ImpairedSince: fakeClock.Now().Add(-instancestatus.ImpairmentTolerationDuration),
+		}}
+		provider.errors[instancestatus.SystemStatus] = errors.New("system assessment failed")
+		ExpectApplied(ctx, env.Client, nodeClaim, node)
+
+		legacyController := statuscontroller.NewController(
+			env.Client,
+			fakeClock,
+			provider,
+			interruption.NewLegacyStatusInterruptionHandler(env.Client, fakeClock, events.NewRecorder(&record.FakeRecorder{})),
+		)
+		_ = ExpectSingletonReconcileFailed(ctx, legacyController)
+
+		ExpectNotFound(ctx, env.Client, nodeClaim)
+		node = ExpectExists(ctx, env.Client, node)
+		condition := ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
+		Expect(condition.Message).To(Equal("EC2 reports a reachability impairment."))
 	})
 
 })

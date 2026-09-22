@@ -17,11 +17,14 @@ package interruption
 import (
 	"context"
 	"fmt"
+	"time"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/samber/lo"
 	"go.uber.org/multierr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
+	"k8s.io/utils/clock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
@@ -39,17 +42,30 @@ import (
 type Action string
 
 const (
-	CordonAndDrain Action = "CordonAndDrain"
-	NoAction       Action = "NoAction"
+	CordonAndDrain      Action = "CordonAndDrain"
+	ForcefulTermination Action = "ForcefulTermination"
+	NoAction            Action = "NoAction"
 )
 
 // InterruptionHandler contains shared logic for handling interruption messages
 // from both the SQS queue and the DescribeInstanceStatus API.
 type InterruptionHandler struct {
 	kubeClient                  client.Client
+	clock                       clock.Clock
 	recorder                    events.Recorder
 	unavailableOfferingsCache   *cache.UnavailableOfferings
 	capacityReservationProvider capacityreservation.Provider
+}
+
+// NewLegacyStatusInterruptionHandler creates the compatibility handler used for
+// DescribeInstanceStatus impairments when NodeRepair is disabled.
+func NewLegacyStatusInterruptionHandler(kubeClient client.Client, clk clock.Clock, recorder events.Recorder) func(context.Context, messages.Message) error {
+	handler := &InterruptionHandler{
+		kubeClient: kubeClient,
+		clock:      clk,
+		recorder:   recorder,
+	}
+	return handler.handleMessage
 }
 
 // handleMessage takes an action against every node involved in the message that is owned by a NodePool.
@@ -102,6 +118,11 @@ func (h *InterruptionHandler) handleNodeClaim(ctx context.Context, msg messages.
 	h.markUnavailableOfferings(ctx, msg, nodeClaim)
 
 	switch action {
+	case ForcefulTermination:
+		if err := h.annotateTerminationTimestamp(ctx, nodeClaim); err != nil {
+			return err
+		}
+		return h.deleteNodeClaim(ctx, msg, nodeClaim, node)
 	case CordonAndDrain:
 		return h.deleteNodeClaim(ctx, msg, nodeClaim, node)
 	default:
@@ -151,12 +172,27 @@ func (h *InterruptionHandler) deleteNodeClaim(ctx context.Context, msg messages.
 	return nil
 }
 
+// annotateTerminationTimestamp causes termination to bypass graceful drain and volume detachment waits.
+func (h *InterruptionHandler) annotateTerminationTimestamp(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
+	if _, ok := nodeClaim.Annotations[karpv1.NodeClaimTerminationTimestampAnnotationKey]; ok {
+		return nil
+	}
+	if h.clock == nil {
+		return fmt.Errorf("annotating termination timestamp, clock is not configured")
+	}
+	stored := nodeClaim.DeepCopy()
+	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
+		karpv1.NodeClaimTerminationTimestampAnnotationKey: h.clock.Now().Format(time.RFC3339),
+	})
+	return client.IgnoreNotFound(h.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)))
+}
+
 // notifyForMessage publishes the relevant alert based on the message kind
 func (h *InterruptionHandler) notifyForMessage(msg messages.Message, nodeClaim *karpv1.NodeClaim, n *corev1.Node) {
 	switch msg.Kind() {
 	case messages.RebalanceRecommendationKind:
 		h.recorder.Publish(interruptionevents.RebalanceRecommendation(n, nodeClaim)...)
-	case messages.ScheduledChangeKind, messages.EventStatusKind:
+	case messages.ScheduledChangeKind, messages.InstanceStatusKind, messages.SystemStatusKind, messages.EventStatusKind:
 		h.recorder.Publish(interruptionevents.Unhealthy(n, nodeClaim)...)
 	case messages.SpotInterruptionKind:
 		h.recorder.Publish(interruptionevents.SpotInterrupted(n, nodeClaim)...)
@@ -172,6 +208,8 @@ func (h *InterruptionHandler) notifyForMessage(msg messages.Message, nodeClaim *
 
 func actionForMessage(msg messages.Message) Action {
 	switch msg.Kind() {
+	case messages.InstanceStatusKind, messages.SystemStatusKind:
+		return ForcefulTermination
 	case messages.ScheduledChangeKind, messages.EventStatusKind, messages.SpotInterruptionKind, messages.InstanceStoppedKind, messages.InstanceTerminatedKind, messages.CapacityReservationInterruptionKind:
 		return CordonAndDrain
 	default:

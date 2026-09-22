@@ -34,8 +34,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
 	"sigs.k8s.io/karpenter/pkg/operator/injection"
+	nodeutils "sigs.k8s.io/karpenter/pkg/utils/node"
 
 	"github.com/aws/karpenter-provider-aws/pkg/apis"
+	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages"
+	instancestatusmsg "github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages/instancestatus"
 	awserrors "github.com/aws/karpenter-provider-aws/pkg/errors"
 	instancestatusprovider "github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/utils"
@@ -43,9 +46,14 @@ import (
 
 const reconcileInterval = time.Minute
 
+const (
+	impairedConditionMessage = "EC2 reports a reachability impairment."
+	healthyConditionMessage  = "EC2 reports no reachability impairment."
+)
+
 type assessmentResult struct {
-	statuses map[string]instancestatusprovider.HealthStatus
-	err      error
+	statusesByInstanceID map[string]instancestatusprovider.HealthStatus
+	err                  error
 }
 
 type registeredNode struct {
@@ -53,18 +61,32 @@ type registeredNode struct {
 	node       *corev1.Node
 }
 
-// Controller publishes EC2 instance and system reachability assessments as Node health.
-type Controller struct {
-	kubeClient client.Client
-	provider   instancestatusprovider.Provider
-	clock      clock.Clock
+type interruptionObservation struct {
+	instanceID    string
+	kind          messages.Kind
+	impairedSince time.Time
 }
 
-func NewController(kubeClient client.Client, clk clock.Clock, provider instancestatusprovider.Provider) *Controller {
+// Controller publishes EC2 instance and system reachability assessments as Node health.
+// When configured, it also preserves direct interruption remediation for clusters with NodeRepair disabled.
+type Controller struct {
+	kubeClient                client.Client
+	provider                  instancestatusprovider.Provider
+	clock                     clock.Clock
+	legacyInterruptionHandler func(context.Context, messages.Message) error
+}
+
+func NewController(
+	kubeClient client.Client,
+	clk clock.Clock,
+	provider instancestatusprovider.Provider,
+	legacyInterruptionHandler func(context.Context, messages.Message) error,
+) *Controller {
 	return &Controller{
-		kubeClient: kubeClient,
-		provider:   provider,
-		clock:      clk,
+		kubeClient:                kubeClient,
+		provider:                  provider,
+		clock:                     clk,
+		legacyInterruptionHandler: legacyInterruptionHandler,
 	}
 }
 
@@ -74,8 +96,9 @@ func (c *Controller) Reconcile(ctx context.Context) (reconciler.Result, error) {
 	instanceAssessment, systemAssessment, scanErr := c.scanHealth(ctx)
 	observationTime := c.clock.Now()
 
-	err := c.publishConditions(ctx, instanceAssessment, systemAssessment, observationTime)
-	if errs := multierr.Combine(err, scanErr); errs != nil {
+	publishErr := c.publishConditions(ctx, instanceAssessment, systemAssessment, observationTime)
+	interruptionErr := c.handleLegacyInterruption(ctx, instanceAssessment, systemAssessment, observationTime)
+	if errs := multierr.Combine(publishErr, interruptionErr, scanErr); errs != nil {
 		return reconciler.Result{}, errs
 	}
 	return reconciler.Result{RequeueAfter: reconcileInterval}, nil
@@ -100,7 +123,7 @@ func (c *Controller) scanHealth(ctx context.Context) (assessmentResult, assessme
 func (c *Controller) scan(ctx context.Context, category instancestatusprovider.Category) assessmentResult {
 	statuses, err := c.provider.List(ctx, category)
 	result := assessmentResult{
-		statuses: map[string]instancestatusprovider.HealthStatus{},
+		statusesByInstanceID: map[string]instancestatusprovider.HealthStatus{},
 	}
 	if err != nil {
 		if awserrors.IsUnauthorizedOperationError(err) {
@@ -111,9 +134,81 @@ func (c *Controller) scan(ctx context.Context, category instancestatusprovider.C
 		return result
 	}
 	for _, status := range statuses {
-		result.statuses[status.InstanceID] = status
+		result.statusesByInstanceID[status.InstanceID] = status
 	}
 	return result
+}
+
+func (c *Controller) handleLegacyInterruption(
+	ctx context.Context,
+	instanceAssessment assessmentResult,
+	systemAssessment assessmentResult,
+	observationTime time.Time,
+) error {
+	if c.legacyInterruptionHandler == nil {
+		return nil
+	}
+
+	observations := legacyInterruptionObservations(instanceAssessment, systemAssessment, observationTime)
+	errs := make([]error, len(observations))
+	workqueue.ParallelizeUntil(ctx, 10, len(observations), func(i int) {
+		if err := c.legacyInterruptionHandler(ctx, instancestatusmsg.New(
+			observations[i].instanceID,
+			observations[i].kind,
+			observations[i].impairedSince,
+		)); err != nil {
+			errs[i] = fmt.Errorf("handling EC2 %s interruption, %w", observations[i].kind, err)
+		}
+	})
+	return multierr.Combine(errs...)
+}
+
+func legacyInterruptionObservations(
+	instanceAssessment assessmentResult,
+	systemAssessment assessmentResult,
+	observationTime time.Time,
+) []interruptionObservation {
+	observationsByInstanceID := map[string]interruptionObservation{}
+	// Emit one action per instance. Instance status is the stable reason when both categories
+	// qualify, while the earliest impairment time is retained for the aggregate observation.
+	addLegacyInterruptionObservations(observationsByInstanceID, instanceAssessment, messages.InstanceStatusKind, observationTime)
+	addLegacyInterruptionObservations(observationsByInstanceID, systemAssessment, messages.SystemStatusKind, observationTime)
+
+	observations := make([]interruptionObservation, 0, len(observationsByInstanceID))
+	for _, observation := range observationsByInstanceID {
+		observations = append(observations, observation)
+	}
+	return observations
+}
+
+func addLegacyInterruptionObservations(
+	observationsByInstanceID map[string]interruptionObservation,
+	assessment assessmentResult,
+	kind messages.Kind,
+	observationTime time.Time,
+) {
+	if assessment.err != nil {
+		return
+	}
+	for _, status := range assessment.statusesByInstanceID {
+		if observationTime.Sub(status.ImpairedSince) < instancestatusprovider.ImpairmentTolerationDuration {
+			continue
+		}
+		current, ok := observationsByInstanceID[status.InstanceID]
+		if !ok {
+			observationsByInstanceID[status.InstanceID] = interruptionObservation{
+				instanceID:    status.InstanceID,
+				kind:          kind,
+				impairedSince: status.ImpairedSince,
+			}
+			continue
+		}
+		if status.ImpairedSince.IsZero() ||
+			(!current.impairedSince.IsZero() && status.ImpairedSince.Before(current.impairedSince)) {
+			current.impairedSince = status.ImpairedSince
+			observationsByInstanceID[status.InstanceID] = current
+		}
+	}
 }
 
 func (c *Controller) publishConditions(
@@ -127,8 +222,8 @@ func (c *Controller) publishConditions(
 	if !instanceComplete && !systemComplete {
 		return nil
 	}
-	if (!instanceComplete && len(systemAssessment.statuses) == 0) ||
-		(!systemComplete && len(instanceAssessment.statuses) == 0) {
+	if (!instanceComplete && len(systemAssessment.statusesByInstanceID) == 0) ||
+		(!systemComplete && len(instanceAssessment.statusesByInstanceID) == 0) {
 		return nil
 	}
 
@@ -152,8 +247,8 @@ func (c *Controller) publishCondition(
 	systemAssessment assessmentResult,
 	observationTime time.Time,
 ) error {
-	instanceHealth, instanceImpaired := instanceAssessment.statuses[instanceID]
-	systemHealth, systemImpaired := systemAssessment.statuses[instanceID]
+	instanceHealth, instanceImpaired := instanceAssessment.statusesByInstanceID[instanceID]
+	systemHealth, systemImpaired := systemAssessment.statusesByInstanceID[instanceID]
 
 	instanceComplete := instanceAssessment.err == nil
 	systemComplete := systemAssessment.err == nil
@@ -164,10 +259,8 @@ func (c *Controller) publishCondition(
 		node,
 		instanceHealth,
 		instanceImpaired,
-		instanceComplete,
 		systemHealth,
 		systemImpaired,
-		systemComplete,
 		observationTime,
 	)
 	if err := c.patchCondition(ctx, node, condition); err != nil {
@@ -177,6 +270,9 @@ func (c *Controller) publishCondition(
 }
 
 func (c *Controller) registeredNodes(ctx context.Context) ([]registeredNode, error) {
+	// Node labels alone are not authoritative here: registration labels can be written before
+	// the NodeClaim registration condition and can outlive the NodeClaim. Joining both informer
+	// caches ensures health is published only for a registered managed Node and NodeClaim pair.
 	type nodeClaimListResult struct {
 		list *karpv1.NodeClaimList
 		err  error
@@ -248,6 +344,8 @@ func registeredNodesFor(nodeClaims []karpv1.NodeClaim, nodes []corev1.Node) []re
 }
 
 func nodeClaimIsRegistered(nodeClaim *karpv1.NodeClaim) bool {
+	// Avoid StatusConditions here. Even observed-only condition sets allocate per NodeClaim,
+	// and the default condition set mutates objects returned with UnsafeDisableDeepCopy.
 	for i := range nodeClaim.Status.Conditions {
 		condition := &nodeClaim.Status.Conditions[i]
 		if condition.Type == karpv1.ConditionTypeRegistered {
@@ -261,25 +359,23 @@ func conditionForAssessments(
 	node *corev1.Node,
 	instanceHealth instancestatusprovider.HealthStatus,
 	instanceImpaired bool,
-	instanceComplete bool,
 	systemHealth instancestatusprovider.HealthStatus,
 	systemImpaired bool,
-	systemComplete bool,
 	observationTime time.Time,
 ) corev1.NodeCondition {
 	status := corev1.ConditionFalse
 	reason := instancestatusprovider.ReasonNoImpairmentReported
-	message := "EC2 reports no recognized instance or system reachability impairment."
+	message := healthyConditionMessage
 	transitionTime := observationTime
 	if instanceImpaired || systemImpaired {
 		status = corev1.ConditionTrue
 		reason = instancestatusprovider.ReasonReachabilityFailed
-		message = impairmentMessage(instanceImpaired, instanceComplete, systemImpaired, systemComplete)
+		message = impairedConditionMessage
 		transitionTime = earliestImpairedSince(observationTime, instanceHealth, instanceImpaired, systemHealth, systemImpaired)
 	}
 
-	current := conditionForType(node, instancestatusprovider.ConditionTypeEC2StatusImpaired)
-	if current != nil && current.Status == status {
+	current := nodeutils.GetCondition(node, instancestatusprovider.ConditionTypeEC2StatusImpaired)
+	if current.Type == instancestatusprovider.ConditionTypeEC2StatusImpaired && current.Status == status {
 		transitionTime = current.LastTransitionTime.Time
 		reason = current.Reason
 	}
@@ -290,25 +386,6 @@ func conditionForAssessments(
 		Reason:             reason,
 		Message:            message,
 	}
-}
-
-func impairmentMessage(instanceImpaired, instanceComplete, systemImpaired, systemComplete bool) string {
-	var message string
-	switch {
-	case instanceImpaired && systemImpaired:
-		message = "EC2 instance and system reachability checks are failing."
-	case instanceImpaired:
-		message = "EC2 instance reachability check is failing."
-	case systemImpaired:
-		message = "EC2 system reachability check is failing."
-	}
-	if !instanceComplete {
-		message += " The EC2 instance status assessment did not complete."
-	}
-	if !systemComplete {
-		message += " The EC2 system status assessment did not complete."
-	}
-	return message
 }
 
 func earliestImpairedSince(
@@ -338,18 +415,9 @@ func earliestImpairedSince(
 	return earliest
 }
 
-func conditionForType(node *corev1.Node, conditionType corev1.NodeConditionType) *corev1.NodeCondition {
-	for i := range node.Status.Conditions {
-		if node.Status.Conditions[i].Type == conditionType {
-			return &node.Status.Conditions[i]
-		}
-	}
-	return nil
-}
-
 func (c *Controller) patchCondition(ctx context.Context, node *corev1.Node, condition corev1.NodeCondition) error {
-	current := conditionForType(node, condition.Type)
-	if current != nil && equality.Semantic.DeepEqual(*current, condition) {
+	current := nodeutils.GetCondition(node, condition.Type)
+	if current.Type == condition.Type && equality.Semantic.DeepEqual(current, condition) {
 		return nil
 	}
 

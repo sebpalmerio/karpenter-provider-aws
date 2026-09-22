@@ -308,7 +308,7 @@ func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 		{
 			ConditionType:          instancestatus.ConditionTypeEC2StatusImpaired,
 			ConditionStatus:        corev1.ConditionTrue,
-			TolerationDuration:     2 * time.Minute,
+			TolerationDuration:     instancestatus.ImpairmentTolerationDuration,
 			TerminationGracePeriod: lo.ToPtr(5 * time.Minute),
 			Action:                 cloudprovider.ReplaceNode,
 		},

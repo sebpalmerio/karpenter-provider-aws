@@ -45,6 +45,8 @@ const (
 	ConditionTypeEC2StatusImpaired corev1.NodeConditionType = "EC2StatusImpaired"
 	ReasonReachabilityFailed       string                   = "ReachabilityFailed"
 	ReasonNoImpairmentReported     string                   = "NoImpairmentReported"
+	// ImpairmentTolerationDuration is shared by voluntary repair and the compatibility interruption path.
+	ImpairmentTolerationDuration = 2 * time.Minute
 )
 
 var instanceStatusFilters = map[Category][]ec2types.Filter{

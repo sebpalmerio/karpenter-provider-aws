@@ -99,7 +99,12 @@ var _ = BeforeSuite(func() {
 	sqsProvider = lo.Must(sqs.NewDefaultProvider(sqsapi, fmt.Sprintf("https://sqs.%s.amazonaws.com/%s/test-cluster", fake.DefaultRegion, fake.DefaultAccount)))
 	controller = interruption.NewController(env.Client, events.NewRecorder(&record.FakeRecorder{}), sqsProvider, servicesqs.NewFromConfig(aws.Config{}), unavailableOfferingsCache, awsEnv.CapacityReservationProvider)
 	eventStatusController = interruption.NewScheduledEventController(env.Client, events.NewRecorder(&record.FakeRecorder{}), awsEnv.InstanceStatusProvider)
-	instanceStatusController = statuscontroller.NewController(env.Client, fakeClock, awsEnv.InstanceStatusProvider)
+	instanceStatusController = statuscontroller.NewController(
+		env.Client,
+		fakeClock,
+		awsEnv.InstanceStatusProvider,
+		nil,
+	)
 })
 
 var _ = AfterSuite(func() {
