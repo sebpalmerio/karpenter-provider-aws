@@ -163,6 +163,8 @@ Number of nodeclaims disrupted in total by Karpenter. Labeled by reason the node
     - `instance_stopped` — The EC2 instance was stopped.
     - `instance_terminated` — The EC2 instance was terminated.
     - `capacity_reservation_interrupted` — The instance's capacity reservation was interrupted.
+    - `instance_status` — An EC2 instance reachability status check remained impaired while Node Repair was disabled.
+    - `system_status` — An EC2 system reachability status check remained impaired while Node Repair was disabled.
     - `event_status` — An EC2 scheduled-event status check fired for the instance.
   - `nodepool` — The name of the NodePool that owns the resource.
   - `capacity_type` — The capacity type of the instance.

@@ -239,6 +239,8 @@ To enable full interruption handling, configure the `--interruption-queue` CLI a
 
 Additionally, Karpenter uses the [EC2 DescribeInstanceStatus](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-system-instance-status-check.html) API for scheduled maintenance events and reachability checks. Scheduled maintenance events remain on the interruption path described above. Instance and system reachability failures are instead published as a single `EC2StatusImpaired=True` Node condition.
 
+When `NodeRepair=false`, Karpenter preserves the existing interruption behavior: an instance or system reachability failure that remains impaired for two minutes forcefully terminates the affected NodeClaim.
+
 When `NodeRepair=true`, an `EC2StatusImpaired` condition that persists for two minutes is eligible for voluntary node repair. Karpenter pre-spins a replacement, waits for it to become ready, and then drains and terminates the impaired node with a five-minute maximum drain window. These checks do not require the `--interruption-queue` to be configured, only EC2 DescribeInstanceStatus IAM permissions.
 
 ### Node Auto Repair

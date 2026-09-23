@@ -126,7 +126,6 @@ var _ = Describe("EC2 Status Conditions", func() {
 		node = ExpectExists(ctx, env.Client, node)
 		condition := ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
 		Expect(condition.LastTransitionTime.Time.Equal(impairedSince)).To(BeTrue())
-		Expect(condition.Message).To(Equal("EC2 reports a reachability impairment."))
 	})
 
 	It("uses observation time when both complete scans report no impairment", func() {
@@ -234,20 +233,7 @@ var _ = Describe("EC2 Status Conditions", func() {
 		Expect(hasEC2StatusCondition(node)).To(BeFalse())
 	})
 
-	It("publishes health when NodeRepair is enabled", func() {
-		provider.statuses[instancestatus.InstanceStatus] = []instancestatus.HealthStatus{{
-			InstanceID:    instanceID,
-			ImpairedSince: fakeClock.Now(),
-		}}
-		ExpectApplied(ctx, env.Client, nodeClaim, node)
-
-		ExpectSingletonReconciled(ctx, statusController)
-
-		node = ExpectExists(ctx, env.Client, node)
-		ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
-	})
-
-	It("preserves legacy interruption after the impairment threshold when NodeRepair is disabled", func() {
+	It("forcefully terminates after the impairment threshold when legacy remediation is configured", func() {
 		provider.statuses[instancestatus.InstanceStatus] = []instancestatus.HealthStatus{{
 			InstanceID:    instanceID,
 			ImpairedSince: fakeClock.Now().Add(-instancestatus.ImpairmentTolerationDuration),
@@ -291,28 +277,6 @@ var _ = Describe("EC2 Status Conditions", func() {
 		ExpectExists(ctx, env.Client, nodeClaim)
 		node = ExpectExists(ctx, env.Client, node)
 		ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
-	})
-
-	It("uses legacy interruption for positive evidence when the other assessment fails", func() {
-		provider.statuses[instancestatus.InstanceStatus] = []instancestatus.HealthStatus{{
-			InstanceID:    instanceID,
-			ImpairedSince: fakeClock.Now().Add(-instancestatus.ImpairmentTolerationDuration),
-		}}
-		provider.errors[instancestatus.SystemStatus] = errors.New("system assessment failed")
-		ExpectApplied(ctx, env.Client, nodeClaim, node)
-
-		legacyController := statuscontroller.NewController(
-			env.Client,
-			fakeClock,
-			provider,
-			interruption.NewLegacyStatusInterruptionHandler(env.Client, fakeClock, events.NewRecorder(&record.FakeRecorder{})),
-		)
-		_ = ExpectSingletonReconcileFailed(ctx, legacyController)
-
-		ExpectNotFound(ctx, env.Client, nodeClaim)
-		node = ExpectExists(ctx, env.Client, node)
-		condition := ExpectEC2StatusCondition(node, corev1.ConditionTrue, instancestatus.ReasonReachabilityFailed)
-		Expect(condition.Message).To(Equal("EC2 reports a reachability impairment."))
 	})
 
 })

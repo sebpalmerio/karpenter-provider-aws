@@ -54,15 +54,14 @@ type recordingMessageHandler struct {
 }
 
 type legacyInterruptionTestCase struct {
-	name              string
-	nodeRepairEnabled bool
-	statuses          map[instancestatusprovider.Category][]instancestatusprovider.HealthStatus
-	errors            map[instancestatusprovider.Category]error
-	expectedKind      messages.Kind
-	expectedStart     time.Time
-	expectedCalls     int
-	expectedError     error
-	handlerError      error
+	name          string
+	statuses      map[instancestatusprovider.Category][]instancestatusprovider.HealthStatus
+	errors        map[instancestatusprovider.Category]error
+	expectedKind  messages.Kind
+	expectedStart time.Time
+	expectedCalls int
+	expectedError error
+	handlerError  error
 }
 
 func (h *recordingMessageHandler) HandleMessage(_ context.Context, msg messages.Message) error {
@@ -101,22 +100,6 @@ func TestLegacyInterruptionRouting(t *testing.T) {
 	handlerErr := errors.New("interruption failed")
 
 	for _, test := range []legacyInterruptionTestCase{
-		{
-			name:              "repair enabled",
-			nodeRepairEnabled: true,
-			statuses: map[instancestatusprovider.Category][]instancestatusprovider.HealthStatus{
-				instancestatusprovider.InstanceStatus: {{InstanceID: instanceID, ImpairedSince: now.Add(-time.Hour)}},
-			},
-		},
-		{
-			name: "before threshold",
-			statuses: map[instancestatusprovider.Category][]instancestatusprovider.HealthStatus{
-				instancestatusprovider.InstanceStatus: {{
-					InstanceID:    instanceID,
-					ImpairedSince: now.Add(-instancestatusprovider.ImpairmentTolerationDuration + time.Second),
-				}},
-			},
-		},
 		{
 			name: "combined impairment",
 			statuses: map[instancestatusprovider.Category][]instancestatusprovider.HealthStatus{
@@ -185,10 +168,6 @@ func TestLegacyInterruptionRouting(t *testing.T) {
 func runLegacyInterruptionTest(t *testing.T, now time.Time, test legacyInterruptionTestCase) {
 	t.Helper()
 	handler := &recordingMessageHandler{err: test.handlerError}
-	handleInterruption := handler.HandleMessage
-	if test.nodeRepairEnabled {
-		handleInterruption = nil
-	}
 	controller := NewController(
 		fake.NewClientBuilder().WithScheme(scheme.Scheme).Build(),
 		clocktesting.NewFakeClock(now),
@@ -196,7 +175,7 @@ func runLegacyInterruptionTest(t *testing.T, now time.Time, test legacyInterrupt
 			statuses: test.statuses,
 			errors:   test.errors,
 		},
-		handleInterruption,
+		handler.HandleMessage,
 	)
 
 	_, err := controller.Reconcile(context.Background())

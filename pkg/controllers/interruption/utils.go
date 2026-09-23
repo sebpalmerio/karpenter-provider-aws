@@ -172,7 +172,10 @@ func (h *InterruptionHandler) deleteNodeClaim(ctx context.Context, msg messages.
 	return nil
 }
 
-// annotateTerminationTimestamp causes termination to bypass graceful drain and volume detachment waits.
+// annotateTerminationTimestamp sets the NodeClaimTerminationTimestampAnnotationKey annotation
+// to the current time, causing the termination controller to bypass graceful drain (PDB-respecting
+// eviction) and volume detachment waits. This is used for instance health failures where the
+// instance is already broken and graceful drain may not be possible.
 func (h *InterruptionHandler) annotateTerminationTimestamp(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
 	if _, ok := nodeClaim.Annotations[karpv1.NodeClaimTerminationTimestampAnnotationKey]; ok {
 		return nil
