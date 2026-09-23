@@ -19,7 +19,9 @@ import (
 
 	"github.com/samber/lo"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/sets"
 	corecloudprovider "sigs.k8s.io/karpenter/pkg/cloudprovider"
+	"sigs.k8s.io/karpenter/pkg/controllers/node/health"
 
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 
@@ -41,11 +43,25 @@ var _ = Describe("Repair Policies", func() {
 		Expect(policy.Action).To(Equal(corecloudprovider.ReplaceNode))
 	})
 
-	It("registers every supported condition as an explicit replacement fallback", func() {
+	It("registers one global fallback and preserves all other condition policies", func() {
+		fallbacks := 0
 		for _, policy := range cloudProvider.RepairPolicies() {
-			Expect(policy.ReasonRegex).To(BeEmpty())
+			if policy.ReasonRegex == "" {
+				fallbacks++
+			} else {
+				Expect(policy.ReasonRegex).To(Equal(".*"))
+			}
 			Expect(policy.Action).To(Equal(corecloudprovider.ReplaceNode))
 		}
+		Expect(fallbacks).To(Equal(1))
+	})
+
+	It("registers a valid reason-aware policy set", func() {
+		_, err := health.NewRepairPolicyMatcher(
+			cloudProvider.RepairPolicies(),
+			sets.New(corecloudprovider.ReplaceNode),
+		)
+		Expect(err).NotTo(HaveOccurred())
 	})
 
 	It("preserves forceful replacement for the pre-existing health policies", func() {
