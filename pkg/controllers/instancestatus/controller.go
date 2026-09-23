@@ -308,7 +308,6 @@ func (c *Controller) registeredNodes(ctx context.Context) ([]registeredNode, err
 
 func registeredNodesFor(nodeClaims []karpv1.NodeClaim, nodes []corev1.Node) []registeredNode {
 	registeredInstanceIDs := make(map[string]struct{}, len(nodeClaims))
-	registeredProviderIDs := make(map[string]string, len(nodeClaims))
 	for i := range nodeClaims {
 		nodeClaim := &nodeClaims[i]
 		if nodeClaim.Spec.NodeClassRef == nil ||
@@ -322,16 +321,11 @@ func registeredNodesFor(nodeClaims []karpv1.NodeClaim, nodes []corev1.Node) []re
 			continue
 		}
 		registeredInstanceIDs[instanceID] = struct{}{}
-		registeredProviderIDs[nodeClaim.Status.ProviderID] = instanceID
 	}
 
 	registeredNodes := make([]registeredNode, 0, min(len(nodes), len(registeredInstanceIDs)))
 	for i := range nodes {
 		node := &nodes[i]
-		if instanceID, ok := registeredProviderIDs[node.Spec.ProviderID]; ok {
-			registeredNodes = append(registeredNodes, registeredNode{instanceID: instanceID, node: node})
-			continue
-		}
 		instanceID, err := utils.ParseInstanceID(node.Spec.ProviderID)
 		if err != nil {
 			continue
