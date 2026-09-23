@@ -22,6 +22,7 @@ import (
 	"github.com/patrickmn/go-cache"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/karpenter/pkg/cloudprovider"
+	coreoptions "sigs.k8s.io/karpenter/pkg/operator/options"
 
 	arczonalshiftcontroller "github.com/aws/karpenter-provider-aws/pkg/controllers/arczonalshift"
 
@@ -32,6 +33,7 @@ import (
 	sdk "github.com/aws/karpenter-provider-aws/pkg/aws"
 	crcapacitytype "github.com/aws/karpenter-provider-aws/pkg/controllers/capacityreservation/capacitytype"
 	crexpiration "github.com/aws/karpenter-provider-aws/pkg/controllers/capacityreservation/expiration"
+	instancestatuscontroller "github.com/aws/karpenter-provider-aws/pkg/controllers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/metrics"
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/nodeclass"
 	nodeclasshash "github.com/aws/karpenter-provider-aws/pkg/controllers/nodeclass/hash"
@@ -99,6 +101,10 @@ func NewControllers(
 	caBundle *string,
 	celEnv *kubeletcel.CELEnvironment,
 ) []controller.Controller {
+	legacyStatusInterruptionHandler := interruption.NewLegacyStatusInterruptionHandler(kubeClient, clk, recorder)
+	if coreoptions.FromContext(ctx).FeatureGates.NodeRepair {
+		legacyStatusInterruptionHandler = nil
+	}
 	controllers := []controller.Controller{
 		nodeclasshash.NewController(kubeClient, caBundle),
 		nodeclass.NewController(clk, kubeClient, cloudProvider, recorder, cfg.Region, subnetProvider, securityGroupProvider, amiProvider, instanceProfileProvider, instanceTypeProvider, launchTemplateProvider, capacityReservationProvider, placementGroupProvider, ec2api, validationCache, recreationCache, amiResolver, celEnv, options.FromContext(ctx).DisableDryRun),
@@ -114,7 +120,13 @@ func NewControllers(
 		crexpiration.NewController(clk, kubeClient, cloudProvider, capacityReservationProvider),
 		metrics.NewController(kubeClient, cloudProvider),
 		arczonalshiftcontroller.NewController(kubeClient, recorder, zonalshiftProvider),
-		interruption.NewInstanceStatusController(kubeClient, clk, cloudProvider, recorder, instanceStatusProvider),
+		instancestatuscontroller.NewController(
+			kubeClient,
+			clk,
+			instanceStatusProvider,
+			legacyStatusInterruptionHandler,
+		),
+		interruption.NewScheduledEventController(kubeClient, recorder, instanceStatusProvider),
 	}
 	// Instance profile garbage collection requires IAM API access. Skip registering the controller when running
 	// in isolated VPC mode to avoid initiating calls to public AWS endpoints that won’t be reachable.
@@ -124,7 +136,7 @@ func NewControllers(
 	if options.FromContext(ctx).InterruptionQueue != "" {
 		sqsAPI := servicesqs.NewFromConfig(cfg)
 		prov, _ := sqs.NewSQSProvider(ctx, sqsAPI)
-		controllers = append(controllers, interruption.NewController(kubeClient, clk, cloudProvider, recorder, prov, sqsAPI, unavailableOfferings, capacityReservationProvider))
+		controllers = append(controllers, interruption.NewController(kubeClient, recorder, prov, sqsAPI, unavailableOfferings, capacityReservationProvider))
 	}
 	return controllers
 }

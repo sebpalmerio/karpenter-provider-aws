@@ -27,33 +27,76 @@ import (
 const (
 	interruptionSubsystem = "interruption"
 	messageTypeLabel      = "message_type"
-	categoryLabel         = "category"
 )
 
 var (
 	MessageType = opmetrics.Label{
 		Name:   messageTypeLabel,
 		Help:   "The type of interruption message received from the SQS queue. See https://karpenter.sh/docs/concepts/disruption/#interruption.",
-		Values: interruptionKindValues,
-	}
-	Category = opmetrics.Label{
-		Name: categoryLabel,
-		Help: "The EC2 instance status check category that was detected as unhealthy. See https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-system-instance-status-check.html.",
+		Values: interruptionMessageKindValues,
 	}
 )
 
-// msg.Kind() values emitted as message_type and merged into core
-// nodeclaims_disrupted_total reason. NoOpKind is omitted — it short-circuits before emission.
-var interruptionKindValues = []opmetrics.Value{
-	{Name: string(messages.SpotInterruptionKind), Help: "EC2 issued a two-minute Spot interruption notice for the instance."},
-	{Name: string(messages.RebalanceRecommendationKind), Help: "EC2 issued a Spot rebalance recommendation for the instance."},
-	{Name: string(messages.ScheduledChangeKind), Help: "AWS Health scheduled a change (e.g. maintenance or retirement) affecting the instance."},
-	{Name: string(messages.InstanceStoppedKind), Help: "The EC2 instance was stopped."},
-	{Name: string(messages.InstanceTerminatedKind), Help: "The EC2 instance was terminated."},
-	{Name: string(messages.CapacityReservationInterruptionKind), Help: "The instance's capacity reservation was interrupted."},
-	{Name: string(messages.InstanceStatusKind), Help: "An EC2 instance status check reported the instance unhealthy."},
-	{Name: string(messages.SystemStatusKind), Help: "An EC2 system status check reported the instance's host unhealthy."},
-	{Name: string(messages.EventStatusKind), Help: "An EC2 scheduled-event status check fired for the instance."},
+var (
+	spotInterruptionKindValue = opmetrics.Value{
+		Name: string(messages.SpotInterruptionKind),
+		Help: "EC2 issued a two-minute Spot interruption notice for the instance.",
+	}
+	rebalanceRecommendationKindValue = opmetrics.Value{
+		Name: string(messages.RebalanceRecommendationKind),
+		Help: "EC2 issued a Spot rebalance recommendation for the instance.",
+	}
+	scheduledChangeKindValue = opmetrics.Value{
+		Name: string(messages.ScheduledChangeKind),
+		Help: "AWS Health scheduled a change (e.g. maintenance or retirement) affecting the instance.",
+	}
+	instanceStoppedKindValue = opmetrics.Value{
+		Name: string(messages.InstanceStoppedKind),
+		Help: "The EC2 instance was stopped.",
+	}
+	instanceTerminatedKindValue = opmetrics.Value{
+		Name: string(messages.InstanceTerminatedKind),
+		Help: "The EC2 instance was terminated.",
+	}
+	capacityReservationInterruptionKindValue = opmetrics.Value{
+		Name: string(messages.CapacityReservationInterruptionKind),
+		Help: "The instance's capacity reservation was interrupted.",
+	}
+	eventStatusKindValue = opmetrics.Value{
+		Name: string(messages.EventStatusKind),
+		Help: "An EC2 scheduled-event status check fired for the instance.",
+	}
+	instanceStatusKindValue = opmetrics.Value{
+		Name: string(messages.InstanceStatusKind),
+		Help: "An EC2 instance reachability status check remained impaired while Node Repair was disabled.",
+	}
+	systemStatusKindValue = opmetrics.Value{
+		Name: string(messages.SystemStatusKind),
+		Help: "An EC2 system reachability status check remained impaired while Node Repair was disabled.",
+	}
+)
+
+// interruptionMessageKindValues contains only msg.Kind() values emitted by the SQS controller.
+var interruptionMessageKindValues = []opmetrics.Value{
+	spotInterruptionKindValue,
+	rebalanceRecommendationKindValue,
+	scheduledChangeKindValue,
+	instanceStoppedKindValue,
+	instanceTerminatedKindValue,
+	capacityReservationInterruptionKindValue,
+}
+
+// interruptionDisruptionReasonValues contains every provider-owned reason emitted by NodeClaimsDisruptedTotal.
+var interruptionDisruptionReasonValues = []opmetrics.Value{
+	spotInterruptionKindValue,
+	rebalanceRecommendationKindValue,
+	scheduledChangeKindValue,
+	instanceStoppedKindValue,
+	instanceTerminatedKindValue,
+	capacityReservationInterruptionKindValue,
+	instanceStatusKindValue,
+	systemStatusKindValue,
+	eventStatusKindValue,
 }
 
 var (
@@ -89,17 +132,6 @@ var (
 			Buckets:   metrics.DurationBuckets(),
 		},
 		[]opmetrics.Label{},
-		opmetrics.GA,
-	)
-	InstanceStatusUnhealthy = opmetrics.NewPrometheusCounter(
-		crmetrics.Registry,
-		prometheus.CounterOpts{
-			Namespace: metrics.Namespace,
-			Subsystem: interruptionSubsystem,
-			Name:      "instance_status_unhealthy_total",
-			Help:      "Count of unique unhealthy instance statuses detected from EC2 DescribeInstanceStatus. Broken down by status check category.",
-		},
-		[]opmetrics.Label{Category},
 		opmetrics.GA,
 	)
 )

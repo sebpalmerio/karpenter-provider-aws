@@ -50,6 +50,7 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/providers/amifamily"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/capacityreservation"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instance"
+	"github.com/aws/karpenter-provider-aws/pkg/providers/instancestatus"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/instancetype"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/placementgroup"
 	"github.com/aws/karpenter-provider-aws/pkg/providers/securitygroup"
@@ -304,43 +305,71 @@ func (c *CloudProvider) GetSupportedNodeClasses() []status.Object {
 
 func (c *CloudProvider) RepairPolicies() []cloudprovider.RepairPolicy {
 	return []cloudprovider.RepairPolicy{
+		{
+			ConditionType:          instancestatus.ConditionTypeEC2StatusImpaired,
+			ConditionStatus:        corev1.ConditionTrue,
+			TolerationDuration:     instancestatus.ImpairmentTolerationDuration,
+			TerminationGracePeriod: lo.ToPtr(5 * time.Minute),
+			Action:                 cloudprovider.ReplaceNode,
+		},
 		// Supported Kubelet Node Conditions
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      corev1.NodeReady,
-			ConditionStatus:    corev1.ConditionUnknown,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          corev1.NodeReady,
+			ConditionStatus:        corev1.ConditionUnknown,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		// Support Node Monitoring Agent Conditions
 		//
 		{
-			ConditionType:      "AcceleratedHardwareReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 10 * time.Minute,
+			ConditionType:          "AcceleratedHardwareReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     10 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      "StorageReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          "StorageReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      "NetworkingReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          "NetworkingReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      "KernelReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          "KernelReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 		{
-			ConditionType:      "ContainerRuntimeReady",
-			ConditionStatus:    corev1.ConditionFalse,
-			TolerationDuration: 30 * time.Minute,
+			ConditionType:          "ContainerRuntimeReady",
+			ConditionStatus:        corev1.ConditionFalse,
+			ReasonRegex:            ".*",
+			TolerationDuration:     30 * time.Minute,
+			TerminationGracePeriod: lo.ToPtr(time.Duration(0)),
+			Action:                 cloudprovider.ReplaceNode,
 		},
 	}
 }

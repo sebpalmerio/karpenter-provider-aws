@@ -20,8 +20,7 @@ import (
 	"github.com/aws/karpenter-provider-aws/pkg/controllers/interruption/messages"
 )
 
-// Message represents a single category from an EC2 DescribeInstanceStatus response.
-// The Kind maps directly to the EC2 status category (instance_status, system_status, event_status).
+// Message represents one category from an EC2 DescribeInstanceStatus response.
 type Message struct {
 	instanceID string
 	kind       messages.Kind

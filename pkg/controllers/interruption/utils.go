@@ -28,7 +28,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	karpv1 "sigs.k8s.io/karpenter/pkg/apis/v1"
-	"sigs.k8s.io/karpenter/pkg/cloudprovider"
 	"sigs.k8s.io/karpenter/pkg/events"
 	"sigs.k8s.io/karpenter/pkg/metrics"
 	nodeclaimutils "sigs.k8s.io/karpenter/pkg/utils/nodeclaim"
@@ -52,21 +51,29 @@ const (
 // from both the SQS queue and the DescribeInstanceStatus API.
 type InterruptionHandler struct {
 	kubeClient                  client.Client
-	clk                         clock.Clock
-	cloudProvider               cloudprovider.CloudProvider
+	clock                       clock.Clock
 	recorder                    events.Recorder
 	unavailableOfferingsCache   *cache.UnavailableOfferings
 	capacityReservationProvider capacityreservation.Provider
 }
 
+// NewLegacyStatusInterruptionHandler creates the compatibility handler used for
+// DescribeInstanceStatus impairments when NodeRepair is disabled.
+func NewLegacyStatusInterruptionHandler(kubeClient client.Client, clk clock.Clock, recorder events.Recorder) func(context.Context, messages.Message) error {
+	handler := &InterruptionHandler{
+		kubeClient: kubeClient,
+		clock:      clk,
+		recorder:   recorder,
+	}
+	return handler.handleMessage
+}
+
 // handleMessage takes an action against every node involved in the message that is owned by a NodePool.
-// When dryRun is true, it resolves NodeClaims but skips the actual cordon/drain action.
-// Returns true if at least one matching NodeClaim was found in the cluster.
-func (h *InterruptionHandler) handleMessage(ctx context.Context, msg messages.Message, dryRun bool) (found bool, err error) {
+func (h *InterruptionHandler) handleMessage(ctx context.Context, msg messages.Message) (err error) {
 	ctx = log.IntoContext(ctx, log.FromContext(ctx).WithValues("messageKind", msg.Kind()))
 
 	if msg.Kind() == messages.NoOpKind {
-		return false, nil
+		return nil
 	}
 	for _, instanceID := range msg.EC2InstanceIDs() {
 		nodeClaimList := &karpv1.NodeClaimList{}
@@ -75,10 +82,6 @@ func (h *InterruptionHandler) handleMessage(ctx context.Context, msg messages.Me
 			continue
 		}
 		if len(nodeClaimList.Items) == 0 {
-			continue
-		}
-		found = true
-		if dryRun {
 			continue
 		}
 		for _, nodeClaim := range nodeClaimList.Items {
@@ -97,9 +100,9 @@ func (h *InterruptionHandler) handleMessage(ctx context.Context, msg messages.Me
 		}
 	}
 	if err != nil {
-		return found, fmt.Errorf("acting on NodeClaims, %w", err)
+		return fmt.Errorf("acting on NodeClaims, %w", err)
 	}
-	return found, nil
+	return nil
 }
 
 // handleNodeClaim retrieves the action for the message and then performs the appropriate action against the node
@@ -116,9 +119,6 @@ func (h *InterruptionHandler) handleNodeClaim(ctx context.Context, msg messages.
 
 	switch action {
 	case ForcefulTermination:
-		// TODO(Node Repair): Once Node Repair (kubernetes-sigs/karpenter#2398) graduates to GA,
-		// this should be migrated to use repair policies instead of directly annotating the
-		// termination timestamp.
 		if err := h.annotateTerminationTimestamp(ctx, nodeClaim); err != nil {
 			return err
 		}
@@ -177,17 +177,17 @@ func (h *InterruptionHandler) deleteNodeClaim(ctx context.Context, msg messages.
 // eviction) and volume detachment waits. This is used for instance health failures where the
 // instance is already broken and graceful drain may not be possible.
 func (h *InterruptionHandler) annotateTerminationTimestamp(ctx context.Context, nodeClaim *karpv1.NodeClaim) error {
-	if _, exists := nodeClaim.Annotations[karpv1.NodeClaimTerminationTimestampAnnotationKey]; exists {
+	if _, ok := nodeClaim.Annotations[karpv1.NodeClaimTerminationTimestampAnnotationKey]; ok {
 		return nil
+	}
+	if h.clock == nil {
+		return fmt.Errorf("annotating termination timestamp, clock is not configured")
 	}
 	stored := nodeClaim.DeepCopy()
 	nodeClaim.Annotations = lo.Assign(nodeClaim.Annotations, map[string]string{
-		karpv1.NodeClaimTerminationTimestampAnnotationKey: h.clk.Now().Format(time.RFC3339),
+		karpv1.NodeClaimTerminationTimestampAnnotationKey: h.clock.Now().Format(time.RFC3339),
 	})
-	if err := h.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)); err != nil {
-		return client.IgnoreNotFound(err)
-	}
-	return nil
+	return client.IgnoreNotFound(h.kubeClient.Patch(ctx, nodeClaim, client.MergeFrom(stored)))
 }
 
 // notifyForMessage publishes the relevant alert based on the message kind
@@ -195,7 +195,7 @@ func (h *InterruptionHandler) notifyForMessage(msg messages.Message, nodeClaim *
 	switch msg.Kind() {
 	case messages.RebalanceRecommendationKind:
 		h.recorder.Publish(interruptionevents.RebalanceRecommendation(n, nodeClaim)...)
-	case messages.ScheduledChangeKind, messages.EventStatusKind, messages.InstanceStatusKind, messages.SystemStatusKind:
+	case messages.ScheduledChangeKind, messages.InstanceStatusKind, messages.SystemStatusKind, messages.EventStatusKind:
 		h.recorder.Publish(interruptionevents.Unhealthy(n, nodeClaim)...)
 	case messages.SpotInterruptionKind:
 		h.recorder.Publish(interruptionevents.SpotInterrupted(n, nodeClaim)...)

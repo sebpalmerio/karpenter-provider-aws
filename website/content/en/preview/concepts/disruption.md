@@ -222,7 +222,6 @@ If interruption-handling is enabled, Karpenter will watch for upcoming involunta
 * Scheduled Change Health Events (Maintenance Events) 
 * Instance Terminating Events 
 * Instance Stopping Events 
-* Instance Status Check Failures
 
 When Karpenter detects one of these events will occur to your nodes, it automatically taints, drains, and terminates the node(s) ahead of the interruption event to give the maximum amount of time for workload cleanup prior to compute disruption. This enables scenarios where the `terminationGracePeriod` for your workloads may be long or cleanup for your workloads is critical, and you want enough time to be able to gracefully clean-up your pods.
 
@@ -238,19 +237,17 @@ Karpenter handles most interruption events by watching an SQS queue which receiv
 
 To enable full interruption handling, configure the `--interruption-queue` CLI argument with the name of the interruption queue provisioned to handle interruption events.
 
-Additionally, Karpenter utilizes the [EC2 DescribeInstanceStatus](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-system-instance-status-check.html) API to check for unhealthy EC2 instances managed by Karpenter. The status checks Karpenter responds to are:
+Additionally, Karpenter uses the [EC2 DescribeInstanceStatus](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/monitoring-system-instance-status-check.html) API for scheduled maintenance events and reachability checks. Scheduled maintenance events remain on the interruption path described above. Instance and system reachability failures are instead published as a single `EC2StatusImpaired=True` Node condition.
 
-* System Status - surfaces failures in the underlying physical host (hardware or software)
-* Instance Status - surfaces failures in the virtual machine 
-* Scheduled Maintenance Events - surfaces upcoming maintenance events that may affect the instance
+When `NodeRepair=false`, Karpenter preserves the existing interruption behavior: an instance or system reachability failure that remains impaired for two minutes forcefully terminates the affected NodeClaim.
 
-These status checks do not require the `--interruption-queue` to be configured, just EC2 DescribeInstanceStatus IAM permissions.
+When `NodeRepair=true`, an `EC2StatusImpaired` condition that persists for two minutes is eligible for voluntary node repair. Karpenter pre-spins a replacement, waits for it to become ready, and then drains and terminates the impaired node with a five-minute maximum drain window. These checks do not require the `--interruption-queue` to be configured, only EC2 DescribeInstanceStatus IAM permissions.
 
 ### Node Auto Repair
 
 <i class="fa-solid fa-circle-info"></i> <b>Feature State: </b> Karpenter v1.1.0 [alpha]({{<ref "../reference/settings#feature-gates" >}})
 
-Node Auto Repair is a feature that automatically identifies and replaces unhealthy nodes in your cluster, helping to maintain overall cluster health. Nodes can experience various types of failures affecting their hardware, file systems, or container environments. These failures may be surfaced through node conditions such as network unavailability, disk pressure, memory pressure, or other conditions reported by node diagnostic agents. When Karpenter detects these unhealthy conditions, it automatically replaces the affected nodes based on cloud provider-defined repair policies. Once a node has been in an unhealthy state beyond its configured toleration duration, Karpenter will forcefully terminate the node and its corresponding NodeClaim, bypassing the standard drain and grace period procedures to ensure swift replacement of problematic nodes. To prevent cascading failures, Karpenter includes safety mechanisms: it will not perform repairs if more than 20% of nodes in a NodePool are unhealthy, and for standalone NodeClaims, it evaluates this threshold against all nodes in the cluster. This ensures your cluster remains in a healthy state with minimal manual intervention, even in scenarios where normal node termination procedures might be impacted by the node's unhealthy state.
+Node Auto Repair is a feature that automatically identifies and replaces unhealthy nodes in your cluster, helping to maintain overall cluster health. Nodes can experience various types of failures affecting their hardware, file systems, or container environments. These failures may be surfaced through node conditions such as network unavailability, disk pressure, memory pressure, or other conditions reported by node diagnostic agents. When a condition remains unhealthy beyond its cloud provider-defined toleration, Karpenter pre-spins a replacement, waits for it to become ready, and then begins draining and terminating the unhealthy node. The repair policy may set a maximum drain window for conditions that require forceful completion. To prevent cascading failures, Karpenter will not perform repairs if more than 20% of nodes in a NodePool are unhealthy. This ensures your cluster remains in a healthy state with minimal manual intervention, even in scenarios where normal node termination procedures might be impacted by the node's unhealthy state.
 
 To enable Node Auto Repair:
   1.  Ensure you have a [Node Monitoring Agent](https://docs.aws.amazon.com/en_us/eks/latest/userguide/node-health.html) deployed or any agent that will add status conditions to nodes that are supported (e.g., Node Problem Detector)
@@ -260,6 +257,11 @@ To enable Node Auto Repair:
 
 Karpenter monitors nodes for the following node status conditions when initiating repair actions:
 
+#### EC2 Status Condition
+
+|         Type        | Status | Toleration Duration |
+| ------------------- | ------ | ------------------- |
+| EC2StatusImpaired   | True   | 2 minutes           |
 
 #### Kubelet Node Conditions
 
