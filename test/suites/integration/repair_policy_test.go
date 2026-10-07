@@ -60,8 +60,8 @@ var _ = Describe("Repair Policy", func() {
 	DescribeTable("Conditions", func(unhealthyCondition corev1.NodeCondition) {
 		env.ExpectCreated(nodeClass, nodePool, dep)
 		pod := env.EventuallyExpectHealthyPodCount(selector, numPods)[0]
-		node := env.ExpectCreatedNodeCount("==", 1)[0]
-		env.EventuallyExpectInitializedNodeCount("==", 1)
+		// Use the initialized node, otherwise the status update strips the initialized label
+		node := env.EventuallyExpectInitializedNodeCount("==", 1)[0]
 
 		node = common.ReplaceNodeConditions(node, unhealthyCondition)
 		env.ExpectStatusUpdated(node)
@@ -72,9 +72,11 @@ var _ = Describe("Repair Policy", func() {
 		// Kubelet Ready False/Unknown aren't tested here: the kubelet owns Ready and re-patches it within its status
 		// update loop, so an injected value reverts before the disruption loop can act. Core's KWOK suite covers them.
 		// Node Monitoring Agent Supported Conditions
+		// A fatal XID replaces after 10m. Other AcceleratedHardwareReady reasons wait 30m or reboot instead.
 		Entry("Node AcceleratedHardwareReady False", corev1.NodeCondition{
 			Type:               "AcceleratedHardwareReady",
 			Status:             corev1.ConditionFalse,
+			Reason:             "NvidiaXID79Error",
 			LastTransitionTime: metav1.Time{Time: time.Now().Add(-11 * time.Minute)},
 		}),
 		Entry("Node StorageReady False", corev1.NodeCondition{
