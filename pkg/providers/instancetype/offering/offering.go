@@ -73,18 +73,17 @@ type NodeClass interface {
 }
 
 type DefaultProvider struct {
-	pricingProvider                pricing.Provider
-	capacityReservationProvider    capacityreservation.Provider
-	zonalshiftProvider             arczonalshiftProvider.Provider
-	placementGroupProvider         placementgroup.Provider
-	unavailableOfferings           *awscache.UnavailableOfferings
-	lastUnavailableOfferingsSeqNum sync.Map // instance type -> seqNum
-	cache                          *cache.Cache
-	kubeClient                     client.Client
-	overlayPrices                  map[string]float64
-	overlayPricesMu                sync.RWMutex
-	overlayPricesExpiry            time.Time
-	resolvers                      []OfferingResolver
+	pricingProvider             pricing.Provider
+	capacityReservationProvider capacityreservation.Provider
+	zonalshiftProvider          arczonalshiftProvider.Provider
+	placementGroupProvider      placementgroup.Provider
+	unavailableOfferings        *awscache.UnavailableOfferings
+	cache                       *cache.Cache
+	kubeClient                  client.Client
+	overlayPrices               map[string]float64
+	overlayPricesMu             sync.RWMutex
+	overlayPricesExpiry         time.Time
+	resolvers                   []OfferingResolver
 }
 
 func NewDefaultProvider(
@@ -109,12 +108,11 @@ func NewDefaultProvider(
 	// Register built-in resolvers
 	p.resolvers = []OfferingResolver{
 		&BaseResolver{
-			PricingProvider:                pricingProvider,
-			UnavailableOfferings:           unavailableOfferingsCache,
-			LastUnavailableOfferingsSeqNum: &p.lastUnavailableOfferingsSeqNum,
-			Cache:                          offeringCache,
-			ZonalshiftProvider:             zonalshiftProvider,
-			GetOverlayPrice:                p.GetOverlayPrice,
+			PricingProvider:      pricingProvider,
+			UnavailableOfferings: unavailableOfferingsCache,
+			Cache:                offeringCache,
+			ZonalshiftProvider:   zonalshiftProvider,
+			GetOverlayPrice:      p.GetOverlayPrice,
 		},
 		&ReservedCapacityResolver{
 			PricingProvider:             pricingProvider,

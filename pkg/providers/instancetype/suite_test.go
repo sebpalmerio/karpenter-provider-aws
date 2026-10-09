@@ -2819,6 +2819,54 @@ var _ = Describe("InstanceTypeProvider", func() {
 				}
 			}
 		})
+		Context("Multiple NodeClasses", func() {
+			var otherNodeClass *v1.EC2NodeClass
+			// findOffering returns the m5.xlarge on-demand offering in test-zone-1a
+			findOffering := func(its []*corecloudprovider.InstanceType) *corecloudprovider.Offering {
+				it, ok := lo.Find(its, func(it *corecloudprovider.InstanceType) bool { return it.Name == "m5.xlarge" })
+				Expect(ok).To(BeTrue())
+				of, ok := lo.Find(it.Offerings, func(of *corecloudprovider.Offering) bool {
+					return of.Zone() == "test-zone-1a" && of.CapacityType() == karpv1.CapacityTypeOnDemand
+				})
+				Expect(ok).To(BeTrue())
+				return of
+			}
+			BeforeEach(func() {
+				otherNodeClass = nodeClass.DeepCopy()
+				otherNodeClass.Name = "other-nodeclass"
+				otherNodeClass.Status.Subnets = []v1.Subnet{
+					{ID: "subnet-other1", Zone: "test-zone-1a"},
+					{ID: "subnet-other2", Zone: "test-zone-1b"},
+					{ID: "subnet-other3", Zone: "test-zone-1c"},
+				}
+				ExpectApplied(ctx, env.Client, nodeClass, otherNodeClass)
+				// Populate the offering cache for both NodeClasses
+				for _, nc := range []*v1.EC2NodeClass{nodeClass, otherNodeClass} {
+					its, err := awsEnv.InstanceTypesProvider.List(ctx, nc)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(findOffering(its).Available).To(BeTrue())
+				}
+			})
+			It("should not return stale offerings for one NodeClass after another NodeClass observes an ICE", func() {
+				awsEnv.UnavailableOfferingsCache.MarkUnavailable(ctx, "m5.xlarge", "test-zone-1a", karpv1.CapacityTypeOnDemand, map[string]string{"reason": "test"})
+				// Resolving the other NodeClass first must not hide the ICE from the original NodeClass
+				for _, nc := range []*v1.EC2NodeClass{otherNodeClass, nodeClass} {
+					its, err := awsEnv.InstanceTypesProvider.List(ctx, nc)
+					Expect(err).ToNot(HaveOccurred())
+					Expect(findOffering(its).Available).To(BeFalse())
+				}
+			})
+			It("should not return stale offerings for one NodeClass after another NodeClass observes a subnet becoming unavailable", func() {
+				awsEnv.UnavailableOfferingsCache.MarkSubnetUnavailable("subnet-test1")
+				its, err := awsEnv.InstanceTypesProvider.List(ctx, otherNodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(findOffering(its).Available).To(BeTrue())
+
+				its, err = awsEnv.InstanceTypesProvider.List(ctx, nodeClass)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(findOffering(its).Available).To(BeFalse())
+			})
+		})
 		It("returning an ICE error for capacity type results in a cache miss for every instance type", func() {
 			ExpectApplied(ctx, env.Client, nodeClass)
 			// Initial list of GetInstanceTypes
