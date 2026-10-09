@@ -17,7 +17,6 @@ package offering
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	ec2types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/mitchellh/hashstructure/v2"
@@ -42,12 +41,19 @@ import (
 // BaseResolver resolves base offerings (on-demand and spot) with caching.
 // It is the first resolver in the chain and generates offerings from scratch.
 type BaseResolver struct {
-	PricingProvider                pricing.Provider
-	UnavailableOfferings           *awscache.UnavailableOfferings
-	LastUnavailableOfferingsSeqNum *sync.Map // instance type -> seqNum
-	Cache                          *cache.Cache
-	ZonalshiftProvider             arczonalshiftProvider.Provider
-	GetOverlayPrice                func(ctx context.Context, instanceTypeName string) (float64, bool)
+	PricingProvider      pricing.Provider
+	UnavailableOfferings *awscache.UnavailableOfferings
+	Cache                *cache.Cache
+	ZonalshiftProvider   arczonalshiftProvider.Provider
+	GetOverlayPrice      func(ctx context.Context, instanceTypeName string) (float64, bool)
+}
+
+// cachedOfferings is the value stored in BaseResolver.Cache. The unavailable offerings sequence number is stored
+// with each entry, since entries for the same instance type are keyed per NodeClass configuration and must each be
+// invalidated independently when the unavailable offerings change.
+type cachedOfferings struct {
+	offerings []*cloudprovider.Offering
+	seqNum    uint64
 }
 
 //nolint:gocyclo
@@ -72,20 +78,16 @@ func (r *BaseResolver) ResolveOfferings(
 	isCompatibleWithNodeClass := compatibility.IsCompatibleWithNodeClass(instanceTypeInfo, nodeClass, pg)
 
 	// If the sequence number has changed for the unavailable offerings, we know that we can't use the previously cached value
-	lastSeqNum, ok := r.LastUnavailableOfferingsSeqNum.Load(ec2types.InstanceType(it.Name))
-	if !ok {
-		lastSeqNum = 0
-	}
 	seqNum := r.UnavailableOfferings.SeqNum(ec2types.InstanceType(it.Name))
 	cacheKey := keyBuilder.cacheKeyFromInstanceType(it)
-	if ofs, ok := r.Cache.Get(cacheKey); ok && lastSeqNum == seqNum {
-		offerings = append(offerings, ofs.([]*cloudprovider.Offering)...)
+	if entry, ok := r.Cache.Get(cacheKey); ok && entry.(cachedOfferings).seqNum == seqNum {
+		offerings = append(offerings, entry.(cachedOfferings).offerings...)
 	} else {
 		var pgOpts []awscache.UnavailableOfferingsOption
 		if pg != nil {
 			pgOpts = append(pgOpts, awscache.WithPlacementGroup(pg.ID))
 		}
-		var cachedOfferings []*cloudprovider.Offering
+		var newOfferings []*cloudprovider.Offering
 		for zone := range allZones {
 			var subnetIDs []string
 			isZonalShifted := false
@@ -137,12 +139,11 @@ func (r *BaseResolver) ResolveOfferings(
 				if zonefound {
 					offering.Requirements.Add(scheduling.NewRequirement(v1.LabelTopologyZoneID, corev1.NodeSelectorOpIn, zonalInfo.ZoneID))
 				}
-				cachedOfferings = append(cachedOfferings, offering)
+				newOfferings = append(newOfferings, offering)
 			}
 		}
-		r.Cache.SetDefault(cacheKey, cachedOfferings)
-		r.LastUnavailableOfferingsSeqNum.Store(ec2types.InstanceType(it.Name), seqNum)
-		offerings = append(offerings, cachedOfferings...)
+		r.Cache.SetDefault(cacheKey, cachedOfferings{offerings: newOfferings, seqNum: seqNum})
+		offerings = append(offerings, newOfferings...)
 	}
 	return offerings
 }
