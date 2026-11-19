@@ -101,6 +101,10 @@ func (r *BaseResolver) ResolveOfferings(
 				if capacityType == karpv1.CapacityTypeReserved {
 					continue
 				}
+				// Additional capacity types registered by the cloud provider get their offerings from an additional resolver
+				if _, builtIn := cloudprovider.DefaultCapacityTypeClasses[capacityType]; !builtIn && lo.Contains(cloudprovider.CapacityTypesOf(cloudprovider.CapacityTypeClassOnDemand), capacityType) {
+					continue
+				}
 				// Check both the general ICE signal and the PG-scoped signal.
 				// An offering is unavailable if either the general key or the PG-specific key is in the cache.
 				isUnavailable := r.UnavailableOfferings.IsUnavailable(ec2types.InstanceType(it.Name), zone, subnetIDs, capacityType)
@@ -133,6 +137,10 @@ func (r *BaseResolver) ResolveOfferings(
 					),
 					Price:     price,
 					Available: isCompatibleWithNodeClass && !isUnavailable && hasPrice && itZones.Has(zone) && !isZonalShifted,
+					// Only NodeClass incompatibility is permanent; ICE, a zonal shift and a missing price may all recover, so
+					// they leave the offering Compatible. A zone the type isn't offered in (or has no subnet in) also leaves
+					// it Compatible: that zone is already outside the instance type's zone requirement, so nothing waits on it.
+					Compatible: isCompatibleWithNodeClass,
 				}
 				if zonefound {
 					offering.Requirements.Add(scheduling.NewRequirement(v1.LabelTopologyZoneID, corev1.NodeSelectorOpIn, zonalInfo.ZoneID))

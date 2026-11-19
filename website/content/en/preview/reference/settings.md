@@ -14,6 +14,7 @@ Karpenter surfaces environment variables and CLI parameters to allow you to conf
 |--|--|--|
 | AMI_REFRESH_INTERVAL | \-\-ami-refresh-interval | How often Karpenter refreshes AMI data from EC2. Increasing this value will reduce the number of DescribeImages API calls at the cost of increased staleness in AMI discovery and drift detection. Must be at least 1m. (default = 1m0s)|
 | AWS_FEATURE_GATES | \-\-aws-feature-gates | Optional AWS-specific features can be enabled / disabled using feature gates. Current options are: NodeClassCEL, DRANVIDIAGPU, DRAEFA, RebootForRepair. (default = NodeClassCEL=false,DRANVIDIAGPU=false,DRAEFA=false,RebootForRepair=false)|
+| AWS_SDK_DEBUG_LOG | \-\-aws-sdk-debug-log | If true, then log AWS SDK requests, responses and retries, including bodies, under the aws-sdk logger. Credential headers are redacted, but bodies can contain sensitive data such as user data and the cluster CA bundle. Intended for troubleshooting only.|
 | BATCH_IDLE_DURATION | \-\-batch-idle-duration | The maximum amount of time with no new pending pods that if exceeded ends the current batching window. If pods arrive faster than this time, the batching window will be extended up to the maxDuration. If they arrive slower, the pods will be batched separately. (default = 1s)|
 | BATCH_MAX_DURATION | \-\-batch-max-duration | The maximum length of a batch window. The longer this is, the more pods we can consider for provisioning at one time which usually results in fewer but larger nodes. (default = 10s)|
 | CLUSTER_CA_BUNDLE | \-\-cluster-ca-bundle | Cluster CA bundle for nodes to use for TLS connections with the API server. If not set, this is taken from the controller's TLS configuration.|
@@ -27,7 +28,7 @@ Karpenter surfaces environment variables and CLI parameters to allow you to conf
 | EKS_CONTROL_PLANE | \-\-eks-control-plane | Marking this true means that your cluster is running with an EKS control plane and Karpenter should attempt to discover cluster details from the DescribeCluster API |
 | ENABLE_PROFILING | \-\-enable-profiling | Enable the profiling on the metric endpoint|
 | ENABLE_ZONAL_SHIFT | \-\-enable-zonal-shift | If true, then enable zonal shifting feature.|
-| FEATURE_GATES | \-\-feature-gates | Optional features can be enabled / disabled using feature gates. Current options are: NodeRepair, ReservedCapacity, SpotToSpotConsolidation, NodeOverlay, StaticCapacity, CapacityBuffer, TerminateFirstDrift, TerminateFirstRepair, and PodDeletionCostManagement. (default = NodeRepair=false,ReservedCapacity=true,SpotToSpotConsolidation=false,NodeOverlay=false,StaticCapacity=false,CapacityBuffer=false,TerminateFirstDrift=false,TerminateFirstRepair=false,PodDeletionCostManagement=false)|
+| FEATURE_GATES | \-\-feature-gates | Optional features can be enabled / disabled using feature gates. Current options are: NodeRepair, ReservedCapacity, SpotToSpotConsolidation, NodeOverlay, StaticCapacity, CapacityBuffer, TerminateFirstDrift, TerminateFirstRepair, PodDeletionCostManagement, and PredictionEnabled. (default = NodeRepair=false,ReservedCapacity=true,SpotToSpotConsolidation=false,NodeOverlay=false,StaticCapacity=false,CapacityBuffer=false,TerminateFirstDrift=false,TerminateFirstRepair=false,PodDeletionCostManagement=false,PredictionEnabled=false)|
 | HEALTH_PROBE_PORT | \-\-health-probe-port | The port the health probe endpoint binds to for reporting controller health (default = 8081)|
 | IGNORE_DRA_REQUESTS | \-\-ignore-dra-requests | When set, Karpenter will ignore pods' DRA requests during scheduling simulations. NOTE: This flag will be removed once formal DRA support is GA in Karpenter.|
 | INTERRUPTION_QUEUE | \-\-interruption-queue | Interruption queue is the name of the SQS queue used for processing interruption events from EC2. Interruption handling is disabled if not specified. Enabling interruption handling may require additional permissions on the controller service account. Additional permissions are outlined in the docs.|
@@ -45,6 +46,7 @@ Karpenter surfaces environment variables and CLI parameters to allow you to conf
 | METRICS_PORT | \-\-metrics-port | The port the metric endpoint binds to for operating metrics about the controller itself (default = 8080)|
 | MIN_VALUES_POLICY | \-\-min-values-policy | Min values policy for scheduling. Options include 'Strict' for existing behavior where min values are strictly enforced or 'BestEffort' where Karpenter relaxes min values when it isn't satisfied. (default = Strict)|
 | PREFERENCE_POLICY | \-\-preference-policy | How the Karpenter scheduler should treat preferences. Preferences include preferredDuringSchedulingIgnoreDuringExecution node and pod affinities/anti-affinities and ScheduleAnyways topologySpreadConstraints. Can be one of 'Ignore' and 'Respect' (default = Respect)|
+| PRICING_ENDPOINT_REGION | \-\-pricing-endpoint-region | The AWS region containing the Price List Query API endpoint. If not specified, Karpenter selects an endpoint region based on the cluster region. This does not change the region for which prices are retrieved and has no effect when isolated-vpc is enabled. NOTE: This flag is ALPHA and can be changed or removed at any time.|
 | RESERVED_ENIS | \-\-reserved-enis | Reserved ENIs are not included in the calculations for max-pods or kube-reserved. This is most often used in the VPC CNI custom networking setup https://docs.aws.amazon.com/eks/latest/userguide/cni-custom-network.html. (default = 0)|
 | SCHEDULER_CONFIG | \-\-scheduler-config | A YAML/JSON document configuring the parts of the cluster's kube-scheduler behavior that Karpenter must mirror during scheduling simulation, currently only podTopologySpread.defaultConstraints. Empty means no scheduler-config overrides.|
 | SECURITY_GROUP_REFRESH_INTERVAL | \-\-security-group-refresh-interval | How often Karpenter refreshes security group data from EC2. Increasing this value will reduce the number of DescribeSecurityGroups API calls at the cost of increased staleness in security group discovery. Must be at least 1m. (default = 1m0s)|
@@ -55,7 +57,7 @@ Karpenter surfaces environment variables and CLI parameters to allow you to conf
 
 ### Feature Gates
 
-Karpenter uses [feature gates](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/#feature-gates-for-alpha-or-beta-features) You can enable the feature gates through the `--feature-gates` CLI environment variable or the `FEATURE_GATES` environment variable in the Karpenter deployment. For example, you can configure drift, spotToSpotConsolidation by setting the CLI argument: `--feature-gates Drift=true,SpotToSpotConsolidation=true,ReservedCapacity=true`.
+Karpenter uses [feature gates](https://kubernetes.io/docs/reference/command-line-tools-reference/feature-gates/#feature-gates-for-alpha-or-beta-features). You can enable the feature gates through the `--feature-gates` CLI flag or the `FEATURE_GATES` environment variable in the Karpenter deployment. For example, you can enable spot-to-spot consolidation by setting the CLI argument: `--feature-gates SpotToSpotConsolidation=true`.
 
 | Feature                 | Default | Stage  | Since   | Until   |
 |-------------------------|---------|--------|---------|---------|
@@ -71,6 +73,7 @@ Karpenter uses [feature gates](https://kubernetes.io/docs/reference/command-line
 | TerminateFirstDrift     | false   | Alpha  | v1.15.x |         |
 | TerminateFirstRepair    | false   | Alpha  | v1.15.x |         |
 | PodDeletionCostManagement | false | Alpha  | v1.15.x |         |
+| PredictionEnabled       | false   | Alpha  | v1.16.x |         |
 
 {{% alert title="Note" color="primary" %}}
 In v1, drift has been promoted to stable and the feature gate removed. Users can continue to control drift by using disruption budgets by reason.

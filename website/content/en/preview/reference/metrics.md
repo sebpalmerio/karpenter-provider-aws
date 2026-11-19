@@ -78,6 +78,13 @@ Limits specified on the nodepool that restrict the quantity of resources provisi
   - `resource_type` — The Kubernetes resource type, e.g. `cpu`, `memory`, `pods`.
   - `nodepool` — The name of the NodePool that owns the resource.
 
+### `karpenter_nodepools_drift_backoff_seconds`
+Seconds remaining in the current drift replacement back-off window for a NodePool. The series is present only while the NodePool is backed off and is removed once it becomes eligible again (absent == not backing off). Labeled by NodePool.
+- Type: [Gauge](https://prometheus.io/docs/concepts/metric_types/#gauge)
+- Stability Level: ALPHA
+- Dimensions:
+  - `nodepool` — The name of the NodePool that owns the resource.
+
 ### `karpenter_nodepools_cost_tracker_errors_total`
 Number of errors encountered during cost tracking operations. Labeled by nodepool.
 - Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
@@ -762,6 +769,13 @@ Number of nodes eligible for disruption by Karpenter. Labeled by disruption reas
     - `drifted` — The node drifted from its desired specification.
     - `unhealthy` — The node failed a node-repair health check.
 
+### `karpenter_voluntary_disruption_drift_backoffs_total`
+The number of times a NodePool entered or escalated drift replacement back-off after an unrecoverable failure. Labeled by NodePool.
+- Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
+- Stability Level: ALPHA
+- Dimensions:
+  - `nodepool` — The name of the NodePool that owns the resource.
+
 ### `karpenter_voluntary_disruption_decisions_total`
 Number of disruption decisions performed. Labeled by disruption decision, reason, and consolidation type.
 - Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
@@ -846,6 +860,13 @@ How many seconds of work has been done that is in progress and hasn't been obser
 - Dimensions:
   - `controller` — The name of the controller that emitted the metric.
   - `scheduling_id` — A unique identifier for a scheduling simulation run.
+
+### `karpenter_scheduler_topology_build_duration_seconds`
+Duration of building the cluster topology used by scheduling simulations in seconds.
+- Type: [Histogram](https://prometheus.io/docs/concepts/metric_types/#histogram)
+- Stability Level: ALPHA
+- Dimensions:
+  - `controller` — The name of the controller that emitted the metric.
 
 ### `karpenter_scheduler_scheduling_duration_seconds`
 Duration of scheduling simulations used for deprovisioning and provisioning in seconds.
@@ -1123,6 +1144,19 @@ Total number of conversion webhook panics
 - Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
 - Stability Level: STABLE
 
+### `controller_runtime_client_consistency_wait_duration_seconds`
+Length of time waiting for the cache to observe writes before serving reads.
+- Type: [Histogram](https://prometheus.io/docs/concepts/metric_types/#histogram)
+- Stability Level: STABLE
+- Dimensions:
+  - `operation` — The client read operation that waited for the cache.
+    - `get`
+    - `list`
+  - `result` — The outcome of waiting for the cache to observe prior writes.
+    - `success`
+    - `error`
+    - `timeout`
+
 ### `controller_runtime_active_workers`
 Number of currently used workers per controller
 - Type: [Gauge](https://prometheus.io/docs/concepts/metric_types/#gauge)
@@ -1189,109 +1223,6 @@ Total number of adds handled by workqueue
   - `name` — The name of the workqueue, typically the owning controller's name.
   - `controller` — The name of the controller that emitted the metric.
 
-## Termination Metrics
-
-### `operator_termination_duration_seconds`
-The amount of time taken by an object to terminate completely.
-- Type: [Histogram](https://prometheus.io/docs/concepts/metric_types/#histogram)
-- Stability Level: DEPRECATED
-- Dimensions:
-  - `group` — The API group of the object the metric describes, e.g. `karpenter.sh`.
-  - `kind` — The Kind of the object the metric describes, e.g. `NodeClaim`.
-    - `EC2NodeClass`
-    - `NodeClaim`
-    - `NodePool`
-
-### `operator_termination_current_time_seconds`
-The current amount of time in seconds that an object has been in terminating state.
-- Type: [Gauge](https://prometheus.io/docs/concepts/metric_types/#gauge)
-- Stability Level: DEPRECATED
-- Dimensions:
-  - `namespace` — The namespace of the object the metric describes.
-  - `name` — The name of the object the metric describes.
-  - `group` — The API group of the object the metric describes, e.g. `karpenter.sh`.
-  - `kind` — The Kind of the object the metric describes, e.g. `NodeClaim`.
-    - `EC2NodeClass`
-    - `NodeClaim`
-    - `NodePool`
-
-## Status Condition Metrics
-
-### `operator_status_condition_transitions_total`
-The count of transitions of a given object, type and status.
-- Type: [Counter](https://prometheus.io/docs/concepts/metric_types/#counter)
-- Stability Level: DEPRECATED
-- Dimensions:
-  - `type` — The type dimension. For status-condition metrics it is the status condition type (e.g. `Ready`); for event metrics it is the Kubernetes event type (`Normal` or `Warning`).
-  - `status` — The status of a status condition (e.g. the `Ready` condition). For transition metrics this is the state being left.
-    - `True` — The condition holds.
-    - `False` — The condition does not hold.
-    - `Unknown` — The condition's state has not yet been determined.
-  - `reason` — The reason dimension. For status-condition metrics it is the condition reason; for event metrics it is the Kubernetes event reason.
-  - `group` — The API group of the object the metric describes, e.g. `karpenter.sh`.
-  - `kind` — The Kind of the object the metric describes, e.g. `NodeClaim`.
-    - `EC2NodeClass`
-    - `NodeClaim`
-    - `NodePool`
-
-### `operator_status_condition_transition_seconds`
-The amount of time a condition was in a given state (status) before transitioning to another state (to_status). e.g. Alarm := P99(Updated=False) > 5 minutes
-- Type: [Histogram](https://prometheus.io/docs/concepts/metric_types/#histogram)
-- Stability Level: DEPRECATED
-- Dimensions:
-  - `type` — The type dimension. For status-condition metrics it is the status condition type (e.g. `Ready`); for event metrics it is the Kubernetes event type (`Normal` or `Warning`).
-  - `status` — The status of a status condition (e.g. the `Ready` condition). For transition metrics this is the state being left.
-    - `True` — The condition holds.
-    - `False` — The condition does not hold.
-    - `Unknown` — The condition's state has not yet been determined.
-  - `to_status` — The status a condition transitioned to, for transition metrics.
-    - `True` — The condition holds.
-    - `False` — The condition does not hold.
-    - `Unknown` — The condition's state has not yet been determined.
-  - `group` — The API group of the object the metric describes, e.g. `karpenter.sh`.
-  - `kind` — The Kind of the object the metric describes, e.g. `NodeClaim`.
-    - `EC2NodeClass`
-    - `NodeClaim`
-    - `NodePool`
-
-### `operator_status_condition_current_status_seconds`
-The current amount of time in seconds that a status condition has been in a specific state. Alarm := P99(Updated=Unknown) > 5 minutes
-- Type: [Gauge](https://prometheus.io/docs/concepts/metric_types/#gauge)
-- Stability Level: DEPRECATED
-- Dimensions:
-  - `namespace` — The namespace of the object the metric describes.
-  - `name` — The name of the object the metric describes.
-  - `type` — The type dimension. For status-condition metrics it is the status condition type (e.g. `Ready`); for event metrics it is the Kubernetes event type (`Normal` or `Warning`).
-  - `status` — The status of a status condition (e.g. the `Ready` condition). For transition metrics this is the state being left.
-    - `True` — The condition holds.
-    - `False` — The condition does not hold.
-    - `Unknown` — The condition's state has not yet been determined.
-  - `reason` — The reason dimension. For status-condition metrics it is the condition reason; for event metrics it is the Kubernetes event reason.
-  - `group` — The API group of the object the metric describes, e.g. `karpenter.sh`.
-  - `kind` — The Kind of the object the metric describes, e.g. `NodeClaim`.
-    - `EC2NodeClass`
-    - `NodeClaim`
-    - `NodePool`
-
-### `operator_status_condition_count`
-The number of a condition for a given object, type and status. e.g. Alarm := Available=False > 0
-- Type: [Gauge](https://prometheus.io/docs/concepts/metric_types/#gauge)
-- Stability Level: DEPRECATED
-- Dimensions:
-  - `namespace` — The namespace of the object the metric describes.
-  - `name` — The name of the object the metric describes.
-  - `type` — The type dimension. For status-condition metrics it is the status condition type (e.g. `Ready`); for event metrics it is the Kubernetes event type (`Normal` or `Warning`).
-  - `status` — The status of a status condition (e.g. the `Ready` condition). For transition metrics this is the state being left.
-    - `True` — The condition holds.
-    - `False` — The condition does not hold.
-    - `Unknown` — The condition's state has not yet been determined.
-  - `reason` — The reason dimension. For status-condition metrics it is the condition reason; for event metrics it is the Kubernetes event reason.
-  - `group` — The API group of the object the metric describes, e.g. `karpenter.sh`.
-  - `kind` — The Kind of the object the metric describes, e.g. `NodeClaim`.
-    - `EC2NodeClass`
-    - `NodeClaim`
-    - `NodePool`
-
 ## Client Go Metrics
 
 ### `client_go_request_total`
@@ -1307,7 +1238,18 @@ Request latency in seconds. Broken down by verb, group, version, kind, and subre
 - Type: [Histogram](https://prometheus.io/docs/concepts/metric_types/#histogram)
 - Stability Level: STABLE
 - Dimensions:
-  - `verb` — The HTTP verb of the Kubernetes API request, e.g. `GET`, `POST`.
+  - `verb` — The action of the Kubernetes API request, e.g. `GET`, `LIST`, `CREATE`, `UPDATE`.
+  - `group` — The API group of the request's target resource.
+  - `version` — The API version of the request's target resource.
+  - `kind` — The kind of the request's target resource.
+  - `subresource` — The subresource of the request, if any.
+
+### `client_go_rate_limiter_duration_seconds`
+Time spent waiting on the client-side rate limiter before sending a Kubernetes API request. Broken down by verb, group, version, kind, and subresource.
+- Type: [Histogram](https://prometheus.io/docs/concepts/metric_types/#histogram)
+- Stability Level: ALPHA
+- Dimensions:
+  - `verb` — The action of the Kubernetes API request, e.g. `GET`, `LIST`, `CREATE`, `UPDATE`.
   - `group` — The API group of the request's target resource.
   - `version` — The API version of the request's target resource.
   - `kind` — The kind of the request's target resource.
